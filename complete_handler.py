@@ -37,7 +37,7 @@ from gates import (
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-OWNER_ID = [5963548505, 1614278744]
+OWNER_ID = [5963548505, 5547897619]
 
 # ============================================================================
 # RATE LIMITER

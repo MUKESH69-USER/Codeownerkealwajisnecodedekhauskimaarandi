@@ -41,8 +41,8 @@ from gates import (
     check_stripe_api,
     check_b3_auth,
 )
-BOT_TOKEN = "8395369201:AAEUhgZ9pwsVr3E7uWS_Q0Tr91lKAPzT568"
-OWNER_ID = [5963548505, 1614278744]
+BOT_TOKEN = "8533961422:AAFZEv0tvuYAoCEc3QBW3QeNmi19bBQ2V7U"
+OWNER_ID = [5963548505, 5547897619]
 DARKS_ID = 5963548505
 
 # Increase thread pool to 100 to handle multiple users simultaneously without freezing
@@ -152,7 +152,8 @@ from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
 import requests
 
-uri = "mongodb://rahll_db_user:k0RRXUHqnXMgsCJx@ac-cf1jjpz-shard-00-00.aom0bxs.mongodb.net:27017,ac-cf1jjpz-shard-00-01.aom0bxs.mongodb.net:27017,ac-cf1jjpz-shard-00-02.aom0bxs.mongodb.net:27017/?ssl=true&replicaSet=atlas-z75igo-shard-0&authSource=admin&appName=Cluster0"
+uri = "mongodb+srv://Prince_Mine_pvt:Meandprincehitting@cluster0.blr8vex.mongodb.net/?appName=Cluster0"
+
 client = MongoClient(
     uri,
     server_api=ServerApi('1'),

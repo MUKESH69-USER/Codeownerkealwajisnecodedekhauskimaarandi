@@ -1,0 +1,22 @@
+# Core
+pyTelegramBotAPI==4.16.1
+requests==2.31.0
+httpx==0.27.0
+aiohttp==3.9.3
+aiofiles==23.2.1
+fake-useragent==1.5.0
+cloudscraper==1.2.71
+urllib3==2.2.1
+requests_toolbelt==1.0.0          # <-- ADD THIS
+
+# Admin Commands (Pyrogram)
+pyrogram==2.0.106
+tgcrypto==1.2.5
+pymongo==4.6.1
+psutil==5.9.8
+speedtest-cli==2.1.3
+openai==1.14.3
+
+# Optional / Utilities
+python-dotenv==1.0.1
+certifi==2024.2.2

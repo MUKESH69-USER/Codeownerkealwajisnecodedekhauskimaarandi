@@ -4285,7 +4285,7 @@ def handle_addurls(message):
 
 
 def process_addurls_file(message):
-    """Process uploaded sites file with validation and assign stable IDs."""
+    """Process uploaded sites file with CONCURRENT validation – handles 1‑2 lakh sites quickly."""
     try:
         if not message.document or not message.document.file_name.endswith('.txt'):
             bot.reply_to(message, "❌ Send a **.txt** file only")
@@ -4293,116 +4293,138 @@ def process_addurls_file(message):
 
         status_msg = bot.reply_to(message, "📥 Downloading file...")
 
-        # Download file
         file_info = bot.get_file(message.document.file_id)
         file_data = bot.download_file(file_info.file_path)
         content = file_data.decode('utf-8', errors='ignore')
 
-        # Extract URLs
-        lines = [line.strip() for line in content.split('\n') if line.strip()]
-        lines = list(set(lines))  # Remove duplicates
-
-        if not lines:
+        lines = list(set(line.strip() for line in content.split('\n') if line.strip()))
+        total = len(lines)
+        if total == 0:
             bot.edit_message_text("❌ No URLs found", message.chat.id, status_msg.message_id)
             return
 
-        bot.edit_message_text(f"🔍 Deep Validating **{len(lines)}** sites...\n⏳ Starting...",
+        bot.edit_message_text(f"⚡ Concurrently validating {total} sites...", 
                               message.chat.id, status_msg.message_id, parse_mode="Markdown")
 
+        # Shared counters (thread‑safe via lock)
         added = 0
         skipped = 0
         captcha_count = 0
-        total = len(lines)
-        test_cc = "5242430428405662|03|28|323"  # Test card
+        processed = 0
+        lock = threading.Lock()
+        test_cc = "5242430428405662|03|28|323"
 
-        for idx, site_url in enumerate(lines, 1):
+        # Worker function for each site
+        def validate_url(url):
+            nonlocal added, skipped, captcha_count, processed
             try:
-                # Clean URL
-                site_url = site_url.strip()
-                if not site_url.startswith(('http://', 'https://')):
-                    site_url = f"https://{site_url}"
-                site_url = site_url.rstrip('/')
+                url = url.strip()
+                if not url.startswith(('http://', 'https://')):
+                    url = f"https://{url}"
+                url = url.rstrip('/')
 
-                # Grab a proxy
-                proxy = random.choice(proxies_data['proxies']) if proxies_data['proxies'] else None
+                proxy = random.choice(proxies_data['proxies']) if proxies_data.get('proxies') else None
 
-                # 1. Simple Check First (Fast)
-                if not validate_shopify_site(site_url, proxy=proxy):
-                    skipped += 1
-                    continue
+                # Quick validation (product availability)
+                if not validate_shopify_site(url, proxy=proxy):
+                    with lock:
+                        skipped += 1
+                    return
 
-                # 2. DEEP CHECK – perform a dry-run check with test card
-                response = check_shopify_api(site_url, test_cc, proxy)
-                
+                # Deep check
+                response = check_shopify_api(url, test_cc, proxy)
                 is_valid = False
                 gateway_name = "Shopify Payments"
-                captcha_detected = False
 
                 if isinstance(response, dict):
                     status = response.get('status', '').upper()
                     msg_text = (response.get('message') or response.get('Response') or '').upper()
 
-                    if 'CAPTCHA' in msg_text or 'CHALLENGE' in msg_text:
-                        captcha_detected = True
-                        captcha_count += 1
+                    if 'CAPTCHA' in msg_text:
+                        with lock:
+                            captcha_count += 1
                     elif status in ['APPROVED', 'APPROVED_OTP', 'DECLINED']:
                         is_valid = True
                     elif status == 'ERROR':
-                        decline_keywords = ['DECLINED', 'INSUFFICIENT', 'INCORRECT', 'FRAUD', 'CARD', 'FUNDS', 'CVV', 'ZIP', 'GENERIC', 'ERROR']
+                        decline_keywords = ['DECLINED', 'INSUFFICIENT', 'INCORRECT', 'FRAUD', 'CARD', 'FUNDS', 'CVV', 'ZIP']
                         if any(k in msg_text for k in decline_keywords):
                             is_valid = True
 
                 if is_valid:
-                    # Site passed deep validation – fetch the actual cheapest price
-                    actual_price = get_site_price(site_url, timeout=10)
-
-                    # Check duplicate
-                    if not any(s['url'] == site_url for s in sites_data['sites']):
-                        new_id = get_next_site_id()
-                        sites_data['sites'].append({
-                            'id': new_id,
-                            'url': site_url,
-                            'name': site_url.replace('https://', '').replace('http://', ''),
-                            'price': f"{actual_price:.2f}",
-                            'gateway': gateway_name,
-                            'last_response': response.get('Response', 'Unknown') if isinstance(response, dict) else 'Unknown'
-                        })
-                        added += 1
-                    else:
-                        skipped += 1
+                    actual_price = get_site_price(url, timeout=10)
+                    with lock:
+                        if not any(s['url'] == url for s in sites_data['sites']):
+                            new_id = get_next_site_id()
+                            sites_data['sites'].append({
+                                'id': new_id,
+                                'url': url,
+                                'name': url.replace('https://','').replace('http://',''),
+                                'price': f"{actual_price:.2f}",
+                                'gateway': gateway_name,
+                                'last_response': response.get('Response', 'Unknown') if isinstance(response, dict) else 'Unknown'
+                            })
+                            added += 1
+                        else:
+                            skipped += 1
                 else:
+                    with lock:
+                        skipped += 1
+            except Exception:
+                with lock:
                     skipped += 1
+            finally:
+                with lock:
+                    processed += 1
 
-                # Update progress every 5 sites
-                if idx % 5 == 0 or idx == total:
+        # Process concurrently with 30 workers (adjust as needed)
+        with ThreadPoolExecutor(max_workers=30) as executor:
+            futures = {executor.submit(validate_url, url): url for url in lines}
+            
+            # Update progress in a background thread every second
+            def progress_updater():
+                while processed < total:
+                    try:
+                        bot.edit_message_text(
+                            f"⚡ Validating...\n"
+                            f"Progress: {processed}/{total}\n"
+                            f"✅ Added: {added}\n"
+                            f"⛔ Captcha: {captcha_count}\n"
+                            f"⚠️ Skipped: {skipped}",
+                            message.chat.id, status_msg.message_id
+                        )
+                    except:
+                        pass
+                    time.sleep(1)
+                # Final update
+                try:
                     bot.edit_message_text(
-                        f"🔍 **Deep Validation Progress**\n"
-                        f"Checked: {idx}/{total}\n"
+                        f"⚡ Validating...\n"
+                        f"Progress: {processed}/{total}\n"
                         f"✅ Added: {added}\n"
-                        f"⛔ Captcha/Bad: {captcha_count}\n"
-                        f"⚠️ Skipped: {skipped - captcha_count}",
-                        message.chat.id, status_msg.message_id,
-                        parse_mode="Markdown"
+                        f"⛔ Captcha: {captcha_count}\n"
+                        f"⚠️ Skipped: {skipped}",
+                        message.chat.id, status_msg.message_id
                     )
+                except:
+                    pass
 
-                time.sleep(1)  # Slight delay to be safe
+            progress_thread = threading.Thread(target=progress_updater)
+            progress_thread.daemon = True
+            progress_thread.start()
 
-            except Exception as e:
-                print(f"❌ Exception for {site_url}: {e}")
-                skipped += 1
-                continue
+            # Wait for all futures (no individual time.sleep)
+            for _ in as_completed(futures):
+                pass
 
         # Save and final report
         save_json(SITES_FILE, sites_data)
-
-        final_text = (
+        bot.edit_message_text(
             f"✅ **FILTERING COMPLETE!**\n\n"
-            f"➕ Added: **{added}** (Working Sites)\n"
+            f"➕ Added: **{added}**\n"
             f"⛔ Blocked: **{captcha_count}** (Captcha/No Token)\n"
-            f"📦 Total in DB: **{len(sites_data['sites'])}**"
+            f"📦 Total in DB: **{len(sites_data['sites'])}**",
+            message.chat.id, status_msg.message_id, parse_mode="Markdown"
         )
-
-        bot.edit_message_text(final_text, message.chat.id, status_msg.message_id, parse_mode="Markdown")
 
     except Exception as e:
         bot.reply_to(message, f"❌ Error: {str(e)}")
@@ -5392,53 +5414,70 @@ def process_clean_sites(message):
             return
 
         total_sites = len(sites_data['sites'])
-        status_msg = bot.reply_to(message, f"🧹 **Cleaning {total_sites} sites...**", parse_mode='Markdown')
-        
-        valid_sites = []
-        test_cc = "5242430428405662|03|28|323"
-        proxy = random.choice(proxies_data['proxies']) if proxies_data['proxies'] else None
+        status_msg = bot.reply_to(message, f"🧹 Cleaning {total_sites} sites concurrently...", parse_mode='Markdown')
 
-        for i, site_obj in enumerate(sites_data['sites']):
-            if i % 10 == 0:
+        valid_sites = []
+        lock = threading.Lock()
+        test_cc = "5242430428405662|03|28|323"
+        processed = 0
+
+        def check_site(site_obj):
+            nonlocal processed
+            proxy = random.choice(proxies_data['proxies']) if proxies_data.get('proxies') else None
+            try:
+                api_resp = check_shopify_api(site_obj['url'], test_cc, proxy)
+                response_text, status, gateway = process_shopify_api_response(api_resp, site_obj.get('price', '0.00'))
+                if status != 'ERROR' and "CAPTCHA" not in response_text.upper():
+                    with lock:
+                        site_obj['last_response'] = response_text[:30]
+                        valid_sites.append(site_obj)
+            except Exception as e:
+                pass
+            finally:
+                with lock:
+                    processed += 1
+
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {executor.submit(check_site, site): site for site in sites_data['sites']}
+            
+            def progress_updater():
+                while processed < total_sites:
+                    try:
+                        bot.edit_message_text(
+                            f"🧹 Cleaning...\n"
+                            f"Checked: {processed}/{total_sites}\n"
+                            f"✅ Valid: {len(valid_sites)}",
+                            message.chat.id, status_msg.message_id, parse_mode='Markdown'
+                        )
+                    except:
+                        pass
+                    time.sleep(1)
                 try:
                     bot.edit_message_text(
-                        f"🧹 **Cleaning Sites...**\n\n"
-                        f"Checking: {site_obj['url']}\n"
-                        f"Progress: {i}/{total_sites}\n"
-                        f"✅ Valid: {len(valid_sites)}\n"
-                        f"❌ Removed: {i - len(valid_sites)}",
-                        chat_id=message.chat.id,
-                        message_id=status_msg.message_id,
-                        parse_mode='Markdown'
+                        f"🧹 Cleaning...\n"
+                        f"Checked: {processed}/{total_sites}\n"
+                        f"✅ Valid: {len(valid_sites)}",
+                        message.chat.id, status_msg.message_id, parse_mode='Markdown'
                     )
                 except:
                     pass
 
-            try:
-                from gates import check_shopify_api, process_shopify_api_response
-                api_resp = check_shopify_api(site_obj['url'], test_cc, proxy)
-                response_text, status, gateway = process_shopify_api_response(api_resp, site_obj.get('price', '0.00'))
-                if status != 'ERROR' and "CAPTCHA" not in response_text.upper():
-                    site_obj['last_response'] = response_text[:30]
-                    valid_sites.append(site_obj)
+            progress_thread = threading.Thread(target=progress_updater)
+            progress_thread.daemon = True
+            progress_thread.start()
 
-            except Exception as e:
-                print(f"⚠️ Error checking site {site_obj.get('url')}: {e}")
-                continue
-
-            time.sleep(0.5)
+            for _ in as_completed(futures):
+                pass
 
         sites_data['sites'] = valid_sites
         save_json(SITES_FILE, sites_data)
 
         removed = total_sites - len(valid_sites)
         bot.edit_message_text(
-            f"✅ **Site Cleaning Finished!**\n\n"
+            f"✅ Cleaning Finished!\n\n"
             f"🗑 Removed: {removed}\n"
             f"💎 Active Sites: {len(valid_sites)}",
-            chat_id=message.chat.id,
-            message_id=status_msg.message_id,
-            parse_mode='Markdown'
+            message.chat.id, status_msg.message_id, parse_mode='Markdown'
         )
 
     except Exception as e:

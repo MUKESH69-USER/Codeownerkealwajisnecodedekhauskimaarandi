@@ -1,5 +1,5 @@
-# complete_handler.py – Final polished version
-# Responsive, beautiful UI, clickable NOVA signature, all features included.
+# complete_handler.py – TEST BOT (PayPal + Shopify focused)
+# Fast stop, 30 concurrent, progress bar, site IDs in hits, clean UI.
 
 import requests
 import time
@@ -20,23 +20,17 @@ from datetime import datetime, date
 from gates import (
     check_shopify_api,
     process_shopify_api_response,
-    check_paypal_onyx,       # now maps to real PayPal
-    check_stripe_api,        # Stripe $5 charge
-    check_chaos,
-    check_adyen,
-    check_app_auth,
-    check_arcenus,
-    check_paypal_fixed,      # real PayPal
-    check_paypal_general,    # real PayPal
-    check_b3_auth,           # real Stripe Auth
-    check_stripe_onyx,
-    check_stripe_working,
-    check_stripe5,
-    check_stripe_auth,
-    # New real gates
-    check_paypal_custom,
-    check_authorize_net,
-    check_braintree_b3,
+    check_stripe_api,        # Stripe $5
+    check_stripe_auth,       # Stripe Auth
+    check_paypal_charge,     # PayPal $1 (external API)
+    # other gates still imported but not used in UI
+    check_stripe5, check_stripe_auth,
+    check_authorize_net, check_braintree_b3,
+    check_paypal_fixed, check_paypal_general, check_paypal_onyx,
+    check_chaos, check_adyen, check_app_auth, check_stripe_onyx,
+    check_arcenus, check_stripe_working, check_payflow, check_random,
+    check_shopify_onyx, check_skrill, check_random_stripe,
+    check_razorpay, check_payu, check_sk_gateway, check_braintree_api,
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -355,7 +349,7 @@ def stop_button_markup():
     return markup
 
 # ============================================================================
-# MASS CHECK ENGINE – SHOPIFY (with new UI)
+# MASS CHECK ENGINE – SHOPIFY (with modern UI)
 # ============================================================================
 def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
                                user_id, load_json_func, save_json_func, users_file, hit_pref="both"):
@@ -417,7 +411,7 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
                     try:
                         api_resp = check_shopify_api(site_url, cc, proxy)
                         response_text, status, gateway_result = process_shopify_api_response(api_resp, price)
-                        last_response = response_text   # store for UI
+                        last_response = response_text
                         response_upper = (response_text or "").upper()
                         is_captcha = "CAPTCHA" in response_upper
                         if not is_captcha and status in ['APPROVED', 'APPROVED_OTP', 'DECLINED', 'EXPIRED']:
@@ -497,14 +491,14 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
                 cc = futures[future]
                 results['error'].append(error_result(cc, str(e)))
 
-            # Update progress UI with stop button
+            # Update progress UI with stop button and last response
             if time.time() - last_update_time > 4.0 or processed == len(futures) or stopped:
                 try:
                     elapsed = time.time() - start_time
                     cpm = (processed / elapsed) * 60 if elapsed > 0 else 0
                     avg_time = elapsed / processed if processed > 0 else 0
                     progress_bar = format_progress_bar(processed, total)
-                    lr = (last_response or "N/A")[:40] + ("..." if last_response and len(last_response)>40 else "")
+                    lr = (last_response or "N/A")[:40] + ("…" if last_response and len(last_response)>40 else "")
                     msg_text = (
                         f"<b>🛍️ Shopify Multi‑Site</b>\n"
                         f"{progress_bar}\n\n"
@@ -646,7 +640,7 @@ def process_gate_mass_check(bot, message, start_msg, ccs, gate_func, gate_name,
                         cpm = (processed / elapsed) * 60 if elapsed > 0 else 0
                         avg_time = elapsed / processed if processed > 0 else 0
                         progress_bar = format_progress_bar(processed, total)
-                        lr = (last_response or "N/A")[:40] + ("..." if last_response and len(last_response)>40 else "")
+                        lr = (last_response or "N/A")[:40] + ("…" if last_response and len(last_response)>40 else "")
                         msg_text = (
                             f"<b>⚡ {gate_name}</b>\n"
                             f"{progress_bar}\n\n"
@@ -745,7 +739,7 @@ def send_hit(bot, chat_id, res, title):
         logger.error(f"Error sending hit: {e}")
 
 # ============================================================================
-# MAIN SETUP FUNCTION – exports all needed functions
+# MAIN SETUP FUNCTION
 # ============================================================================
 def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
                           check_site_func, is_valid_response_func,
@@ -758,11 +752,10 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
     settings = load_json_func("settings.json", {"gate_limits": {}})
     gate_limits = settings.get("gate_limits", {})
     DEFAULT_GATE_LIMITS = {
-        "shopify": 1000, "chaos": 200, "adyen": 200, "app_auth": 200,
-        "stripe_onyx": 200, "arcenus": 200, "paypal_onyx": 200,
-        "stripe": 200, "paypal_fixed": 200, "paypal_general": 200,
-        "b3_auth": 200, "stripe5": 200, "stripeauth": 200,
-        "paypal_custom": 200, "authorize_net": 200, "braintree_b3": 200,
+        "shopify": 1000,
+        "paypal": 200,
+        "stripe": 200,
+        "stripeauth": 200,
     }
     for k, v in DEFAULT_GATE_LIMITS.items():
         if k not in gate_limits:
@@ -884,6 +877,7 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
             set_user_busy(user_id, False)
             return
 
+        # UPDATED MARKUP – only PayPal & Shopify
         markup = types.InlineKeyboardMarkup(row_width=2)
         markup.add(
             types.InlineKeyboardButton("🛍️ Shopify Multi‑Site", callback_data="run_mass_shopify"),
@@ -894,22 +888,55 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
             types.InlineKeyboardButton("🔐 Stripe Auth", callback_data="run_mass_stripeauth")
         )
         markup.add(
-            types.InlineKeyboardButton("💵 PayPal Custom $1", callback_data="run_mass_paypal_custom"),
-            types.InlineKeyboardButton("💳 Authorize.Net $1", callback_data="run_mass_authorize_net")
-        )
-        markup.add(
-            types.InlineKeyboardButton("🔒 Braintree B3", callback_data="run_mass_braintree_b3"),
+            types.InlineKeyboardButton("💵 PayPal $1 Charge", callback_data="run_mass_paypal"),
             types.InlineKeyboardButton("❌ Cancel", callback_data="action_cancel")
         )
         safe_send(bot.send_message, chat_id, f"💳 <b>Cards to check:</b> {len(ccs)}\n<b>⚡ Select Option:</b>",
                   reply_markup=markup, parse_mode='HTML')
 
-    # ========== FILE UPLOAD HANDLER ==========
+    # ========== FILE UPLOAD HANDLER (with proxy upload support) ==========
     def handle_file_upload_event(message):
         user_id = message.from_user.id
         if not is_user_allowed_func(user_id):
             access_denied(message, "You need an active subscription to upload files.\nPlease purchase a plan or use a redeem code.")
             return
+
+        # Check if user is awaiting proxy file upload
+        if user_sessions.get(str(user_id), {}).get('awaiting_proxy_file'):
+            try:
+                file_name = message.document.file_name.lower()
+                if not file_name.endswith('.txt'):
+                    safe_send(bot.reply_to, message, "❌ Only .txt files allowed.", parse_mode='HTML')
+                    return
+                msg_loading = safe_send(bot.reply_to, message, "⏳ Reading proxies...", parse_mode='HTML')
+                file_info = bot.get_file(message.document.file_id)
+                file_content = bot.download_file(file_info.file_path).decode('utf-8', errors='ignore')
+                proxies = [line.strip() for line in file_content.split('\n') if line.strip() and ':' in line]
+                if not proxies:
+                    safe_send(bot.edit_message_text, "❌ No valid proxies found.", message.chat.id, msg_loading.message_id)
+                    return
+                # Add to user's personal proxy list
+                current_proxies = get_user_proxies(user_id)
+                new_count = 0
+                for p in proxies:
+                    if p not in current_proxies:
+                        current_proxies.append(p)
+                        new_count += 1
+                save_user_proxies(user_id, current_proxies)
+                safe_send(bot.edit_message_text,
+                    f"✅ Added {new_count} new proxies.\nTotal: {len(current_proxies)}",
+                    message.chat.id, msg_loading.message_id,
+                    parse_mode='HTML'
+                )
+            except Exception as e:
+                logger.error(f"Proxy upload error: {traceback.format_exc()}")
+                safe_send(bot.reply_to, message, f"❌ Error: {str(e)}")
+            finally:
+                # Reset the flag
+                user_sessions.get(str(user_id), {}).pop('awaiting_proxy_file', None)
+            return
+
+        # Original CC file processing
         try:
             file_name = message.document.file_name.lower()
             if not file_name.endswith('.txt'):
@@ -935,6 +962,7 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
                 user_sessions[user_id] = {}
             user_sessions[user_id]['ccs'] = ccs
 
+            # UPDATED MARKUP – only PayPal & Shopify
             markup = types.InlineKeyboardMarkup(row_width=2)
             markup.add(
                 types.InlineKeyboardButton("🛍️ Shopify", callback_data="run_mass_shopify"),
@@ -945,11 +973,7 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
                 types.InlineKeyboardButton("🔐 Stripe Auth", callback_data="run_mass_stripeauth")
             )
             markup.add(
-                types.InlineKeyboardButton("💵 PayPal Custom $1", callback_data="run_mass_paypal_custom"),
-                types.InlineKeyboardButton("💳 Authorize.Net $1", callback_data="run_mass_authorize_net")
-            )
-            markup.add(
-                types.InlineKeyboardButton("🔒 Braintree B3", callback_data="run_mass_braintree_b3"),
+                types.InlineKeyboardButton("💵 PayPal $1 Charge", callback_data="run_mass_paypal"),
                 types.InlineKeyboardButton("❌ Cancel", callback_data="action_cancel")
             )
             safe_send(bot.edit_message_text,
@@ -964,6 +988,18 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
     if force_subscribe_decorator:
         handle_file_upload_event = force_subscribe_decorator(handle_file_upload_event)
     bot.message_handler(content_types=['document'])(handle_file_upload_event)
+
+    # ========== PROXY UPLOAD PROMPT (inline button) ==========
+    @bot.callback_query_handler(func=lambda call: call.data == "proxy_upload_prompt")
+    def proxy_upload_prompt(call):
+        bot.answer_callback_query(call.id)
+        sent = safe_send(bot.send_message, call.message.chat.id,
+            "📂 <b>Send me a .txt file with proxies (one per line).</b>",
+            parse_mode='HTML')
+        # Flag this user as awaiting proxy file
+        if str(call.from_user.id) not in user_sessions:
+            user_sessions[str(call.from_user.id)] = {}
+        user_sessions[str(call.from_user.id)]['awaiting_proxy_file'] = True
 
     # ========== Shopify / My Sites Callbacks ==========
     @bot.callback_query_handler(func=lambda call: call.data == "run_mass_shopify")
@@ -1102,23 +1138,11 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
                 set_user_busy(user_id, False)
         threading.Thread(target=mass_thread).start()
 
-    # ========== Gate Map for Mass Checks ==========
+    # ========== Gate Map (only the ones we want in the UI) ==========
     gate_map = {
-        "chaos": (check_chaos, "Chaos Auth"),
-        "adyen": (check_adyen, "Adyen Auth"),
-        "app_auth": (check_app_auth, "App Based Auth"),
-        "stripe_onyx": (check_stripe_onyx, "Stripe (Onyx)"),
-        "arcenus": (check_arcenus, "Arcenus"),
-        "paypal_onyx": (check_paypal_onyx, "PayPal (Onyx)"),
-        "stripe": (check_stripe_api, "Stripe Auth"),
-        "paypal_fixed": (check_paypal_fixed, "PayPal Fixed"),
-        "paypal_general": (check_paypal_general, "PayPal General"),
-        "b3_auth": (check_b3_auth, "Stripe Auth"),
         "stripe5": (check_stripe5, "Stripe $5 Charge"),
         "stripeauth": (check_stripe_auth, "Stripe Auth"),
-        "paypal_custom": (check_paypal_custom, "PayPal Custom"),
-        "authorize_net": (check_authorize_net, "Authorize.Net"),
-        "braintree_b3": (check_braintree_b3, "Braintree B3"),
+        "paypal": (check_paypal_charge, "PayPal $1 Charge"),
     }
 
     for gate_key, (gate_func, gate_name) in gate_map.items():
@@ -1194,4 +1218,4 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
         'clear_stop': clear_stop,
         'is_stop_requested': is_stop_requested,
         'mass_check_semaphore': mass_check_semaphore,
-    }
+                }

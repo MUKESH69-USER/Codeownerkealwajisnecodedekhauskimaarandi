@@ -708,7 +708,7 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
     last_update_time = time.time()
     status_msg = start_msg
 
-    with ThreadPoolExecutor(max_workers=50) as executor:
+    with ThreadPoolExecutor(max_workers=100) as executor:
         futures = {}
         for i, cc in enumerate(ccs):
             if is_stop_requested(chat_id, user_id):

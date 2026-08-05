@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -15,9 +16,7 @@ import threading
 import functools
 import html
 import logging
-import traceback
 from datetime import datetime, timedelta
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -48,6 +47,7 @@ user_sessions = {}   # for storing temporary data like uploaded CCs, pending act
 BOT_START_TIME = time.time()
 
 # ---------- PREMIUM EMOJI INJECTOR ----------
+# These IDs are from Telegram's custom emoji set – they will fallback to plain emojis if unsupported.
 PREMIUM_EMOJIS = {
     "🔥": "5424972470023104089", "✅": "6179298314953956852", "❌": "6181467651395558500",
     "⚠️": "5204047074668083678", "⏳": "5319090522470495400", "⌛": "5447385112612208213",
@@ -57,33 +57,34 @@ PREMIUM_EMOJIS = {
     "⚙️": "5258096772776991776", "📖": "5258328383183396223", "🏠": "5257963315258204021",
     "🔄": "5260687119092817530", "➕": "5274008024585871702", "🧹": "5316570171236694774",
     "🗑️": "5445005936953424165", "🚫": "5316538964004321334", "⛔": "4918014360267260850",
-    "🔒": "5258476306152038031", "🔐": "5897604269141398480", "💳": "5447453226498552490",
-    "📦": "5258134813302332906", "🛡️": "5197288647275071607", "🌐": "5447602197439218445",
-    "📂": "5341492148468465410", "📥": "5443127283898405358", "📋": "5197269100878907942",
-    "🔍": "5444989577422993015", "📝": "5447421246172069841", "🛍️": "5445146945024720188",
-    "💵": "5283232570660634549", "💰": "5444960062407732826", "🛒": "5258024802010026053",
-    "💸": "5447579253723918909", "🧾": "5444856076954520455", "🎟️": "6269340869795518262",
-    "🏦": "5332455502917949981", "👑": "5316993667896981960", "👨‍💻": "6181483972271283011",
-    "👤": "5316727448644103237", "👥": "5256143829672672750", "🎖️": "5316554189663385368",
-    "🔰": "5033242607627535090", "📢": "6267129592998270736", "👋": "5458904472598095631",
-    "📌": "5397782960512444700", "🔹": "6025825239248670891", "🔷": "5972072533833289156",
-    "📅": "5274055917766202507", "💡": "5123359615727174427", "🔆": "5116296400274981694",
-    "🟢": "6179295235462406768", "🔴": "4956395910306202687", "⏱️": "5258258882022612173",
-    "🏓": "5283031441637148958", "♾️": "5316930493223025689", "🚀": "5372917041193828849",
-    "📈": "5258391025281408576", "🪫": "5280652390532395919", "🌍": "5224450179368767019",
-    "🚧": "6017332254953443667", "🛠️": "5462921117423384478", "📊": "5258024802010026053",
-    "🔗": "5256143829672672750", "🥸": "5458904472598095631", "🌈": "5316902932417885675"
+    "🔒": "5258476306152038031", "🔐": "5897604269141398480",
+    "💳": "5447453226498552490", "📦": "5258134813302332906", "🛡️": "5197288647275071607",
+    "🌐": "5447602197439218445", "📂": "5341492148468465410", "📥": "5443127283898405358",
+    "📋": "5197269100878907942", "🔍": "5444989577422993015", "📝": "5447421246172069841",
+    "🛍️": "5445146945024720188", "💵": "5283232570660634549", "💰": "5444960062407732826",
+    "🛒": "5258024802010026053", "💸": "5447579253723918909", "🧾": "5444856076954520455",
+    "🎟️": "6269340869795518262", "🏦": "5332455502917949981",
+    "👑": "5316993667896981960", "👨‍💻": "6181483972271283011", "👤": "5316727448644103237",
+    "👥": "5256143829672672750", "🎖️": "5316554189663385368", "🔰": "5033242607627535090",
+    "📢": "6267129592998270736", "👋": "5458904472598095631", "📌": "5397782960512444700",
+    "🔹": "6025825239248670891", "🔷": "5972072533833289156", "📅": "5274055917766202507",
+    "💡": "5123359615727174427", "🔆": "5116296400274981694", "🟢": "6179295235462406768",
+    "🔴": "4956395910306202687", "⏱️": "5258258882022612173", "🏓": "5283031441637148958",
+    "♾️": "5316930493223025689", "🚀": "5372917041193828849", "📈": "5258391025281408576",
+    "🪫": "5280652390532395919", "🌍": "5224450179368767019", "🚧": "6017332254953443667",
+    "🛠️": "5462921117423384478", "📊": "5258024802010026053", "🔗": "5256143829672672750"
 }
 
 def inject_premium_emojis(text):
+    """Replace plain emoji characters with <tg-emoji> tags for premium rendering."""
     if not text: return text
-    if "<tg-emoji" in text: return text
+    if "<tg-emoji" in text: return text   # already injected
     for emoji_char, emoji_id in PREMIUM_EMOJIS.items():
         if emoji_char in text:
             text = text.replace(emoji_char, f'<tg-emoji emoji-id="{emoji_id}">{emoji_char}</tg-emoji>')
     return text
 
-# Patch bot send methods
+# Patch bot send methods to automatically inject premium emojis
 _orig_send = bot.send_message
 _orig_reply = bot.reply_to
 _orig_edit = bot.edit_message_text
@@ -294,7 +295,7 @@ from gates import (
 
 from complete_handler import setup_complete_handler
 
-# ---------- DEFINE update_stats ----------
+# ---------- DEFINE update_stats (used by complete_handler) ----------
 def update_stats_func(status, mass_check=False):
     global stats_data
     for key in ['approved', 'declined', 'cooked', 'mass_approved', 'mass_declined', 'mass_cooked', 'error', 'mass_error']:
@@ -312,24 +313,25 @@ def update_stats_func(status, mass_check=False):
     stats_data[key] += 1
     save_json(STATS_FILE, stats_data)
 
-# ---------- SETUP COMPLETE HANDLER ----------
+# ---------- SETUP COMPLETE HANDLER (positional arguments) ----------
 handler_utils = setup_complete_handler(
-    bot,
-    get_filtered_sites,
-    proxies_data,
-    check_shopify_api,
-    lambda r: True,
-    process_shopify_api_response,
-    update_stats_func,
-    save_json,
-    load_json,
-    is_approved,
-    users_data,
-    USERS_FILE,
-    force_subscribe_and_name,
-    user_sessions
+    bot,                          # bot
+    get_filtered_sites,           # site_filter_func
+    proxies_data,                 # proxies_data
+    check_shopify_api,            # check_site_func
+    lambda r: True,               # is_valid_response_func (dummy)
+    process_shopify_api_response, # process_response_func
+    update_stats_func,            # update_stats_func
+    save_json,                    # save_json_func_param
+    load_json,                    # load_json_func_param
+    is_approved,                  # is_user_allowed_func
+    users_data,                   # users_data_ref
+    USERS_FILE,                   # users_file_param
+    force_subscribe_and_name,     # force_subscribe_decorator
+    user_sessions                 # user_sessions
 )
 
+# Extract utilities from handler_utils
 set_user_busy = handler_utils['set_user_busy']
 is_user_busy = handler_utils['is_user_busy']
 set_stop = handler_utils['set_stop']
@@ -411,16 +413,24 @@ def send_welcome(message):
     ref_count = len(referrals_data.get(str(user_id), {}).get("referred", []))
 
     welcome_text = f"""
-🌈 <i>Welcome to Stripe Hitter</i> 🌈
+<pre>┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃  <b>🔥   N O V A   ·   V E R I F Y   🔥</b>  ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛</pre>
 
-👋 <i>Welcome aboard,</i> <b>{html.escape(user_name)}</b> 🥸
-
-⚡ <i>Experience the fastest and most reliable Hitter bot on Telegram.</i> ⚡
-
-📌 <i>Select an option from the menu below to manage your account, view commands, or configure your proxies.</i>
-
+<b>👋 Welcome, {html.escape(user_name)}!</b>
 <b>📊 Status:</b> {status_badge}
-<b>🔗 Referral Link:</b> <code>{ref_link}</code>
+
+<pre>┌─────────────────────────────────┐
+│ <b>📌  FREE DM USAGE RULES</b>          │
+├─────────────────────────────────┤
+│ 🔹 Refer 5 friends → 1 Premium Day  │
+│ 🔹 Add <code>@Nova_Shopify_Robot</code> to   │
+│    your name to unlock free     │
+│    single check commands in DM!  │
+└─────────────────────────────────┘</pre>
+
+<b>🔗 Your Referral Link:</b>
+<code>{ref_link}</code>
 👥 <b>Referrals:</b> {ref_count} (5 = 1 day)
 
 <i>⚡ NOVA · <a href="tg://user?id={DARKS_ID}">特Unknownop 𮕌</a></i>
@@ -428,16 +438,16 @@ def send_welcome(message):
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton("💥 Cmds", callback_data="menu_single_gate"),
-        types.InlineKeyboardButton("🌐 Proxy", callback_data="menu_proxy")
+        types.InlineKeyboardButton("💳 Single Check", callback_data="menu_single_gate"),
+        types.InlineKeyboardButton("📦 Mass Check", callback_data="menu_mass_gate")
     )
     markup.add(
-        types.InlineKeyboardButton("🥸 Profile", callback_data="show_info"),
-        types.InlineKeyboardButton("💎 Plan", callback_data="show_plans")
-    )
-    markup.add(
-        types.InlineKeyboardButton("📦 Mass Check", callback_data="menu_mass_gate"),
+        types.InlineKeyboardButton("🛡️ Proxy", callback_data="menu_proxy"),
         types.InlineKeyboardButton("🌐 Sites", callback_data="menu_sites")
+    )
+    markup.add(
+        types.InlineKeyboardButton("💎 Plans", callback_data="show_plans"),
+        types.InlineKeyboardButton("👤 Account", callback_data="show_info")
     )
     markup.add(
         types.InlineKeyboardButton("📖 Help", callback_data="show_help"),
@@ -453,7 +463,9 @@ def send_welcome(message):
 def single_gate_menu(call):
     bot.answer_callback_query(call.id)
     help_text = """
-🌈 <b>SINGLE CHECK GATES</b> 🌈
+<pre>┌─────────────────────────────────┐
+│      💳  SINGLE  CHECK  GATES    │
+└─────────────────────────────────┘</pre>
 
 <b>🔹 All Users (Subscription Required)</b>
 <code>/sh  CC|MM|YYYY|CVV</code>      – 🛍️ Shopify (Multi‑Site)
@@ -470,14 +482,16 @@ def single_gate_menu(call):
 <i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>
 """
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("💥 Back", callback_data="back_to_start"))
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="back_to_start"))
     bot.edit_message_text(help_text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_mass_gate")
 def mass_gate_menu(call):
     bot.answer_callback_query(call.id)
     info_text = """
-🌈 <b>MASS CHECK GATES</b> 🌈
+<pre>┌─────────────────────────────────┐
+│       🚪  MASS  CHECK  GATES       │
+└─────────────────────────────────┘</pre>
 
 <b>📦 How to Mass Check:</b>
 1️⃣ Simply <b>send/upload your <code>.txt</code> file</b> containing your cards.
@@ -495,7 +509,7 @@ def mass_gate_menu(call):
 <i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>
 """
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("💥 Back", callback_data="back_to_start"))
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="back_to_start"))
     bot.edit_message_text(info_text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_proxy")
@@ -506,10 +520,11 @@ def proxy_menu(call):
         types.InlineKeyboardButton("📂 Upload Proxy File", callback_data="proxy_upload_prompt"),
         types.InlineKeyboardButton("📋 View My Proxies", callback_data="proxy_view"),
         types.InlineKeyboardButton("🧹 Clean Dead Proxies", callback_data="proxy_clean"),
-        types.InlineKeyboardButton("💥 Back", callback_data="back_to_start")
+        types.InlineKeyboardButton("🔙 Back", callback_data="back_to_start")
     )
     bot.edit_message_text(
-        "<b>🛡️ Proxy Manager</b>\n\nProxies are required for checking. Add your own or use global ones (if owner).",
+        "<b>🛡️ Proxy Manager</b>\n\n"
+        "Proxies are required for checking. Add your own or use global ones (if owner).",
         call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup
     )
     bot.answer_callback_query(call.id)
@@ -569,10 +584,15 @@ def site_menu(call):
         types.InlineKeyboardButton("🔍 Show Site Details", callback_data="site_show_prompt"),
         types.InlineKeyboardButton("🗑️ Remove Site", callback_data="site_remove_prompt"),
         types.InlineKeyboardButton("🧹 Clear All My Sites", callback_data="site_clear"),
-        types.InlineKeyboardButton("💥 Back", callback_data="back_to_start")
+        types.InlineKeyboardButton("🔙 Back", callback_data="back_to_start")
     )
     bot.edit_message_text(
-        "<b>🌐 Personal Site Manager</b>\n\nCommands:\n<code>/addmysite &lt;url&gt;</code> – Add site(s)\n<code>/mysites</code> – List your sites",
+        "<b>🌐 Personal Site Manager</b>\n\n"
+        "Commands:\n"
+        "<code>/addmysite &lt;url&gt;</code> – Add one or multiple sites\n"
+        "<code>/mysites</code> – List your sites\n"
+        "<code>/rmmyid &lt;id&gt;</code> – Remove a site by ID\n"
+        "<code>/clearmysites</code> – Remove all your sites",
         call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup
     )
     bot.answer_callback_query(call.id)
@@ -582,7 +602,7 @@ def settings_menu(call):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("💰 Set Price Filter", callback_data="set_price_menu"),
-        types.InlineKeyboardButton("💥 Back", callback_data="back_to_start")
+        types.InlineKeyboardButton("🔙 Back", callback_data="back_to_start")
     )
     bot.edit_message_text(
         "<b>⚙️ Settings</b>\n\nCustomize your experience.",
@@ -597,7 +617,7 @@ def set_price_menu(call):
     for price in [5,10,20,30,50,100]:
         markup.add(types.InlineKeyboardButton(f"≤ ${price}", callback_data=f"set_price_{price}"))
     markup.add(types.InlineKeyboardButton("❌ No Filter", callback_data="set_price_none"))
-    markup.add(types.InlineKeyboardButton("💥 Back", callback_data="menu_settings"))
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="menu_settings"))
     bot.edit_message_text(
         f"💰 <b>Set Price Filter</b>\nCurrent: {price_filter or 'None'}\n\nSelect max price:",
         call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup
@@ -627,7 +647,9 @@ def handle_price_callback(call):
 @bot.callback_query_handler(func=lambda call: call.data == "show_plans")
 def show_plans(call):
     plans_text = """
-🌈 <b>PREMIUM PLANS & PRICING</b> 🌈
+<pre>┌─────────────────────────────────┐
+│      💎  PREMIUM  PLANS  💎      │
+└─────────────────────────────────┘</pre>
 
 🔹 <b>Trial</b> — 7 days · <code>$7</code> / <code>⭐ 500</code>
 🔹 <b>Elite</b> — 15 days · <code>$14</code> / <code>⭐ 1000</code>
@@ -651,7 +673,7 @@ def show_plans(call):
     )
     markup.add(types.InlineKeyboardButton("🎟️ Redeem Code", callback_data="redeem_code"))
     markup.add(types.InlineKeyboardButton("👨‍💻 Contact Admin", url="https://t.me/Unknown_bolte"))
-    markup.add(types.InlineKeyboardButton("💥 Back", callback_data="back_to_start"))
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="back_to_start"))
     bot.edit_message_text(plans_text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
     bot.answer_callback_query(call.id)
 
@@ -669,44 +691,56 @@ def show_info(call):
     user_id = call.from_user.id
     user_str = str(user_id)
     if is_owner(user_id):
-        info = f"👑 <b>GOD MODE</b>\n🆔 <code>{user_str}</code>\n♾️ Unlimited"
+        info = f"👑 GOD MODE\n🆔 {user_str}\n♾️ Unlimited"
     elif user_str in users_data:
         data = users_data[user_str]
         try:
             expiry = datetime.fromisoformat(data['expiry'])
             days_left = (expiry - datetime.now()).days
             status = "✅ Active" if days_left > 0 else "⏳ Expired"
-            info = f"💎 <b>Account Profile</b>\n🆔 <code>{user_str}</code>\nStatus: {status}\nExpires: {expiry.strftime('%Y-%m-%d')} ({days_left} days)\nLimit: {data.get('limit',1000)}\nDaily: {data.get('usage_today',0)}/{data.get('daily_limit',10000)}"
+            info = f"💎 Account\n🆔 {user_str}\nStatus: {status}\nExpires: {expiry.strftime('%Y-%m-%d')} ({days_left} days)\nLimit: {data.get('limit',1000)}\nDaily: {data.get('usage_today',0)}/{data.get('daily_limit',10000)}"
         except:
             info = "⚠️ Invalid expiry"
     else:
         info = "🆓 Free user – get a plan!"
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("💎 Plans", callback_data="show_plans"))
-    markup.add(types.InlineKeyboardButton("💥 Back", callback_data="back_to_start"))
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="back_to_start"))
     bot.edit_message_text(info, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "show_help")
 def show_help(call):
     help_text = """
-🌈 <b>QUICK START GUIDE</b> 🌈
-
+<b>📖 QUICK START</b>
 1️⃣ Join our channel (required)
 2️⃣ Add proxies: <code>/addpro ip:port:user:pass</code>
 3️⃣ Upload cards (.txt) or use buttons
 4️⃣ For mass check, upload file then select gate
 
-<b>🛡️ PROXY & CARDS</b>
+<b>🛡️ PROXY</b>
 <code>/addpro</code> – add proxy
 <code>/cleanmyproxies</code> – remove dead
+
+<b>💳 CARDS</b>
 <code>/sh</code> – Shopify single check
+<code>/stripe</code> / <code>/chk</code> – Stripe Auth
 <code>cook</code> – Shopify alias
+
+<b>🌐 PERSONAL SITES</b>
+<code>/addmysite &lt;url&gt;</code> – Add your own Shopify site(s)
+<code>/mysites</code> – List your sites
+<code>/rmmyid &lt;id&gt;</code> – Remove a site
+<code>/clearmysites</code> – Clear all your sites
+
+<b>👤 ACCOUNT</b>
+<code>/info</code> – Account status
+<code>/start</code> – Main menu
 
 <i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>
 """
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("💥 Back", callback_data="back_to_start"))
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="back_to_start"))
     bot.edit_message_text(help_text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
     bot.answer_callback_query(call.id)
 
@@ -716,19 +750,30 @@ def show_owner(call):
         bot.answer_callback_query(call.id, "Restricted", show_alert=True)
         return
     owner_text = """
-👑 <b>OWNER PANEL</b>
+👑 OWNER PANEL
 Commands:
 /pro <userid> <days> – approve user
-/limit <userid> <limit> – set limit
+/limit <userid> <limit> – set per‑upload limit
+/setlimit <userid> <daily_limit> – set daily limit
 /grant <chatid> – approve group
 /users – list users
+/rmuser <userid> – remove user
 /broadcast <msg> – announcement
-/stats – bot stats
+/addurls – add sites from .txt
+/viewsites – list sites
+/rmsiteid <id> – remove site
+/rsite <url> – remove site(s)
+/stats – bot stats (shows proxy counts)
 /ping – latency
 /restart – restart bot
+/setamo – set price filter
+/addproxies – bulk add proxies
+/cleanpro – clean dead proxies (global)
+/cleanshdb – clean Shopify proxies from DB
+/cleanrzdb – clean Razorpay proxies from DB
 """
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("💥 Back", callback_data="back_to_start"))
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="back_to_start"))
     bot.edit_message_text(owner_text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
     bot.answer_callback_query(call.id)
 
@@ -739,30 +784,29 @@ def back_to_start(call):
     status_badge = "💎 PREMIUM" if is_premium else "🆓 Freelancer"
     ref_link = get_referral_link(user_id)
     ref_count = len(referrals_data.get(str(user_id), {}).get("referred", []))
-    
     welcome_text = f"""
-🌈 <i>Welcome to Stripe Hitter</i> 🌈
+<b>🔥 NOVA · VERIFY</b>
 
-👋 <i>Welcome back,</i> <b>{html.escape(call.from_user.first_name or 'User')}</b> 🥸
-📊 <b>Status:</b> {status_badge}
+👋 Welcome back, {html.escape(call.from_user.first_name or 'User')}!
+📊 Status: {status_badge}
 
-🔗 <b>Referral:</b> <code>{ref_link}</code>
-👥 <b>Referrals:</b> {ref_count} (5 = 1 day)
+🔗 Referral: <code>{ref_link}</code>
+👥 Referrals: {ref_count} (5 = 1 day)
 
 <i>⚡ NOVA · <a href="tg://user?id={DARKS_ID}">特Unknownop 𮕌</a></i>
 """
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton("💥 Cmds", callback_data="menu_single_gate"),
-        types.InlineKeyboardButton("🌐 Proxy", callback_data="menu_proxy")
+        types.InlineKeyboardButton("💳 Single Check", callback_data="menu_single_gate"),
+        types.InlineKeyboardButton("📦 Mass Check", callback_data="menu_mass_gate")
     )
     markup.add(
-        types.InlineKeyboardButton("🥸 Profile", callback_data="show_info"),
-        types.InlineKeyboardButton("💎 Plan", callback_data="show_plans")
-    )
-    markup.add(
-        types.InlineKeyboardButton("📦 Mass Check", callback_data="menu_mass_gate"),
+        types.InlineKeyboardButton("🛡️ Proxy", callback_data="menu_proxy"),
         types.InlineKeyboardButton("🌐 Sites", callback_data="menu_sites")
+    )
+    markup.add(
+        types.InlineKeyboardButton("💎 Plans", callback_data="show_plans"),
+        types.InlineKeyboardButton("👤 Account", callback_data="show_info")
     )
     markup.add(
         types.InlineKeyboardButton("📖 Help", callback_data="show_help"),
@@ -853,7 +897,7 @@ def process_proxy_file_upload(message):
     except Exception as e:
         bot.edit_message_text(f"❌ Error: {e}", message.chat.id, status.message_id)
 
-# ---------- COMMAND: /cleanpro ----------
+# ---------- COMMAND: /cleanpro (clean global proxies) ----------
 @bot.message_handler(commands=['cleanpro'])
 def clean_proxies_cmd(message):
     if not is_owner(message.from_user.id):
@@ -888,6 +932,120 @@ def clean_proxies_cmd(message):
     proxies_data['proxies'] = live
     save_json(PROXIES_FILE, proxies_data)
     bot.edit_message_text(f"✅ Cleaned. Live: {len(live)}/{total}", message.chat.id, status.message_id)
+
+# ---------- NEW: /cleanshdb – clean Shopify proxies from DB ----------
+@bot.message_handler(commands=['cleanshdb'])
+def clean_shopify_db(message):
+    if not is_owner(message.from_user.id):
+        bot.reply_to(message, "🚫 Owner only.")
+        return
+    # The global proxy pool is in proxies_data['proxies']; we need to test each for Shopify.
+    # We'll reuse the complete_handler's test_proxy_for_shopify if available, but we'll implement a simple test here.
+    from gates import check_shopify_api, process_shopify_api_response
+    status = bot.reply_to(message, "🧹 Cleaning Shopify proxies from DB...")
+    proxies = proxies_data.get('proxies', [])
+    if not proxies:
+        bot.edit_message_text("No proxies to clean.", message.chat.id, status.message_id)
+        return
+    test_cc = "5242430428405662|03|28|323"
+    # Get a site to test against
+    sites = get_filtered_sites()
+    if not sites:
+        bot.edit_message_text("❌ No sites available to test proxies. Add sites first.", message.chat.id, status.message_id)
+        return
+    site = random.choice(sites)['url']
+    live = []
+    total = len(proxies)
+    def test_shopify_proxy(p):
+        try:
+            # Quick connectivity check first
+            parts = p.split(':')
+            if len(parts)==2:
+                proxy_url = f"http://{parts[0]}:{parts[1]}"
+            else:
+                proxy_url = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+            proxies_dict = {'http': proxy_url, 'https': proxy_url}
+            r = requests.get("http://httpbin.org/ip", proxies=proxies_dict, timeout=5)
+            if r.status_code != 200:
+                return False
+            # Test Shopify
+            api_resp = check_shopify_api(site, test_cc, p)
+            if not api_resp or not isinstance(api_resp, dict):
+                return False
+            status = api_resp.get('status', '')
+            if status == 'ERROR':
+                return False
+            return True
+        except:
+            return False
+    with ThreadPoolExecutor(max_workers=30) as ex:
+        futures = {ex.submit(test_shopify_proxy, p): p for p in proxies}
+        for i, fut in enumerate(as_completed(futures)):
+            p = futures[fut]
+            if fut.result():
+                live.append(p)
+            if i % 50 == 0:
+                bot.edit_message_text(f"🧹 Shopify Progress: {i+1}/{total} – Live: {len(live)}", message.chat.id, status.message_id)
+    proxies_data['proxies'] = live
+    save_json(PROXIES_FILE, proxies_data)
+    bot.edit_message_text(f"✅ Shopify proxy DB cleaned. Live: {len(live)}/{total}", message.chat.id, status.message_id)
+
+# ---------- NEW: /cleanrzdb – clean Razorpay proxies from DB ----------
+@bot.message_handler(commands=['cleanrzdb'])
+def clean_razorpay_db(message):
+    if not is_owner(message.from_user.id):
+        bot.reply_to(message, "🚫 Owner only.")
+        return
+    status = bot.reply_to(message, "🧹 Cleaning Razorpay proxies from DB...")
+    proxies = proxies_data.get('proxies', [])
+    if not proxies:
+        bot.edit_message_text("No proxies to clean.", message.chat.id, status.message_id)
+        return
+    # Razorpay requires authenticated proxies (ip:port:user:pass), so we only test those with 4 parts.
+    # Use a razorpay site if available, else fallback to a known one.
+    from gates import check_razorpay
+    # Try to get a razorpay site from DB (if any)
+    rz_sites = load_json("rz_sites.json", [])
+    if not rz_sites:
+        bot.edit_message_text("❌ No Razorpay sites found. Add with /addrz.", message.chat.id, status.message_id)
+        return
+    site = rz_sites[0]
+    test_cc = "5242430428405662|03|28|323"
+    live = []
+    total = len(proxies)
+    def test_razorpay_proxy(p):
+        parts = p.split(':')
+        if len(parts) != 4:
+            return False  # Razorpay needs auth
+        try:
+            # Quick connectivity
+            proxy_url = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+            proxies_dict = {'http': proxy_url, 'https': proxy_url}
+            r = requests.get("http://httpbin.org/ip", proxies=proxies_dict, timeout=5)
+            if r.status_code != 200:
+                return False
+            # Test Razorpay
+            msg, status = check_razorpay(test_cc, proxy=p, site=site)
+            if status == 'ERROR':
+                # check if it's a connection error
+                if any(k in msg.lower() for k in ['connection', 'timeout', 'unreachable', 'refused']):
+                    return False
+                # other errors might be site-specific, but proxy works
+                return True
+            return True
+        except:
+            return False
+    with ThreadPoolExecutor(max_workers=30) as ex:
+        futures = {ex.submit(test_razorpay_proxy, p): p for p in proxies}
+        for i, fut in enumerate(as_completed(futures)):
+            p = futures[fut]
+            if fut.result():
+                live.append(p)
+            if i % 50 == 0:
+                bot.edit_message_text(f"🧹 Razorpay Progress: {i+1}/{total} – Live: {len(live)}", message.chat.id, status.message_id)
+    proxies_data['proxies'] = live
+    save_json(PROXIES_FILE, proxies_data)
+    bot.edit_message_text(f"✅ Razorpay proxy DB cleaned. Live: {len(live)}/{total}", message.chat.id, status.message_id)
 
 # ---------- OWNER COMMANDS ----------
 @bot.message_handler(commands=['pro'])
@@ -929,6 +1087,22 @@ def set_limit(message):
     except:
         bot.reply_to(message, "Usage: /limit <user_id> <limit>")
 
+@bot.message_handler(commands=['setlimit'])
+def set_daily_limit(message):
+    if not is_owner(message.from_user.id):
+        return
+    try:
+        _, uid, lim = message.text.split()
+        lim = int(lim)
+        if uid in users_data:
+            users_data[uid]['daily_limit'] = lim
+            save_json(USERS_FILE, users_data)
+            bot.reply_to(message, f"✅ Daily limit for {uid} set to {lim}.")
+        else:
+            bot.reply_to(message, "User not found.")
+    except:
+        bot.reply_to(message, "Usage: /setlimit <user_id> <daily_limit>")
+
 @bot.message_handler(commands=['grant'])
 def grant_group(message):
     if not is_owner(message.from_user.id):
@@ -954,6 +1128,21 @@ def list_users(message):
         text += f"<code>{uid}</code> – {exp}\n"
     bot.reply_to(message, text, parse_mode='HTML')
 
+@bot.message_handler(commands=['rmuser'])
+def remove_user(message):
+    if not is_owner(message.from_user.id):
+        return
+    try:
+        _, uid = message.text.split()
+        if uid in users_data:
+            del users_data[uid]
+            save_json(USERS_FILE, users_data)
+            bot.reply_to(message, f"✅ User {uid} removed.")
+        else:
+            bot.reply_to(message, "User not found.")
+    except:
+        bot.reply_to(message, "Usage: /rmuser <user_id>")
+
 @bot.message_handler(commands=['broadcast'])
 def broadcast(message):
     if not is_owner(message.from_user.id):
@@ -973,6 +1162,82 @@ def broadcast(message):
             pass
     bot.reply_to(message, f"✅ Broadcast sent to {count} users.")
 
+@bot.message_handler(commands=['addurls'])
+def add_urls(message):
+    if not is_owner(message.from_user.id):
+        return
+    bot.reply_to(message, "📂 Send a .txt file with site URLs (one per line).")
+    bot.register_next_step_handler(message, process_sites_file)
+
+def process_sites_file(message):
+    if not message.document or not message.document.file_name.endswith('.txt'):
+        bot.reply_to(message, "❌ Send a .txt file.")
+        return
+    status = bot.reply_to(message, "⏳ Processing sites...")
+    try:
+        file_info = bot.get_file(message.document.file_id)
+        content = bot.download_file(file_info.file_path).decode('utf-8', errors='ignore')
+        urls = [line.strip() for line in content.split('\n') if line.strip()]
+        added = 0
+        for url in urls:
+            if not url.startswith('http'):
+                url = 'https://' + url
+            try:
+                r = requests.get(url+'/products.json?limit=1', timeout=5)
+                if r.status_code == 200:
+                    if not any(s['url']==url for s in sites_data['sites']):
+                        sites_data['sites'].append({'url': url, 'price': '0.00', 'gateway': 'Shopify'})
+                        added += 1
+            except:
+                pass
+        save_json(SITES_FILE, sites_data)
+        bot.edit_message_text(f"✅ Added {added} sites. Total: {len(sites_data['sites'])}", message.chat.id, status.message_id)
+    except Exception as e:
+        bot.edit_message_text(f"❌ Error: {e}", message.chat.id, status.message_id)
+
+@bot.message_handler(commands=['viewsites'])
+def view_sites(message):
+    if not is_owner(message.from_user.id):
+        return
+    sites = sites_data.get('sites', [])
+    if not sites:
+        bot.reply_to(message, "No sites.")
+        return
+    text = "🌐 Sites:\n"
+    for site in sites[:30]:
+        text += f"{site['url']} – ${site.get('price','0.00')}\n"
+    if len(sites)>30:
+        text += f"... and {len(sites)-30} more"
+    bot.reply_to(message, text, parse_mode='HTML')
+
+@bot.message_handler(commands=['rmsiteid'])
+def remove_site_id(message):
+    if not is_owner(message.from_user.id):
+        return
+    try:
+        _, sid = message.text.split()
+        sid = int(sid)
+        sites_data['sites'] = [s for s in sites_data['sites'] if s.get('id') != sid]
+        save_json(SITES_FILE, sites_data)
+        bot.reply_to(message, f"✅ Removed site ID {sid}.")
+    except:
+        bot.reply_to(message, "Usage: /rmsiteid <id>")
+
+@bot.message_handler(commands=['rsite'])
+def remove_site_url(message):
+    if not is_owner(message.from_user.id):
+        return
+    try:
+        _, url = message.text.split(maxsplit=1)
+        original = len(sites_data['sites'])
+        sites_data['sites'] = [s for s in sites_data['sites'] if url not in s['url']]
+        removed = original - len(sites_data['sites'])
+        save_json(SITES_FILE, sites_data)
+        bot.reply_to(message, f"✅ Removed {removed} sites matching.")
+    except:
+        bot.reply_to(message, "Usage: /rsite <url_part>")
+
+# ---------- /stats – now shows proxy counts ----------
 @bot.message_handler(commands=['stats'])
 def stats_cmd(message):
     if not is_owner(message.from_user.id):
@@ -980,7 +1245,21 @@ def stats_cmd(message):
     total_sites = len(sites_data.get('sites', []))
     total_proxies = len(proxies_data.get('proxies', []))
     total_users = len(users_data)
-    msg = f"📊 STATS\nSites: {total_sites}\nProxies: {total_proxies}\nUsers: {total_users}\nApproved: {stats_data.get('approved',0)}\nCooked: {stats_data.get('cooked',0)}\nDeclined: {stats_data.get('declined',0)}"
+    # Count Shopify and Razorpay proxies (if stored separately, we just show total for now)
+    # To differentiate, we could store them in separate files, but for simplicity we show total.
+    # We'll also show counts from the 'proxies' array, but we can add a note.
+    msg = (
+        f"📊 STATS\n"
+        f"Sites: {total_sites}\n"
+        f"Proxies (total): {total_proxies}\n"
+        f"Users: {total_users}\n"
+        f"Approved: {stats_data.get('approved',0)}\n"
+        f"Cooked: {stats_data.get('cooked',0)}\n"
+        f"Declined: {stats_data.get('declined',0)}\n"
+        f"Mass Approved: {stats_data.get('mass_approved',0)}\n"
+        f"Mass Cooked: {stats_data.get('mass_cooked',0)}\n"
+        f"Mass Declined: {stats_data.get('mass_declined',0)}"
+    )
     bot.reply_to(message, msg, parse_mode='HTML')
 
 @bot.message_handler(commands=['ping'])
@@ -994,10 +1273,33 @@ def ping_cmd(message):
 def restart_cmd(message):
     if not is_owner(message.from_user.id):
         return
-    bot.reply_to(message, "🔄 Restarting...")
+    bot.reply_to(message, "🔄 Restarting... (simulated)")
     global BOT_START_TIME
     BOT_START_TIME = time.time()
     bot.reply_to(message, "✅ Restarted.")
+
+@bot.message_handler(commands=['setamo'])
+def set_amo(message):
+    if not is_owner(message.from_user.id):
+        return
+    try:
+        _, val = message.text.split()
+        price_filter = float(val)
+        settings_data['price_filter'] = price_filter
+        save_json(SETTINGS_FILE, settings_data)
+        bot.reply_to(message, f"✅ Price filter set to ${price_filter}")
+    except:
+        bot.reply_to(message, "Usage: /setamo <price>")
+
+# ---------- FILE UPLOAD HANDLER FOR PROXY FILES ----------
+@bot.message_handler(content_types=['document'])
+def document_handler(message):
+    user_id = message.from_user.id
+    if user_sessions.get(user_id, {}).get('awaiting_proxy_file'):
+        # This is handled by the next_step callback we set, so we can ignore.
+        return
+    # Otherwise, let complete_handler handle it (it's already registered).
+    pass
 
 # ---------- START BOT ----------
 if __name__ == "__main__":

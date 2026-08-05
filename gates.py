@@ -241,7 +241,7 @@ def check_braintree_b3(cc, proxy=None):
         return f"Braintree error: {str(e)[:80]}", "ERROR"
 
 # ============================================================================
-# SHOPIFY API – UPDATED WITH DIRECT STATUS PARSING
+# SHOPIFY API – UPDATED WITH RAW STATUS & SMART CLASSIFICATION
 # ============================================================================
 def check_shopify_api(site_url, cc, proxy=None):
     """
@@ -249,7 +249,7 @@ def check_shopify_api(site_url, cc, proxy=None):
       - Response: the error message (if any) or the status string
       - status:   'APPROVED', 'DECLINED', 'ERROR', 'APPROVED_OTP'
       - gateway, price, site
-      - raw_response: the raw message from the API (for better classification)
+      - raw_response: the raw message from the API for better classification
     """
     params = {'site': site_url, 'cc': cc}
     if proxy:
@@ -271,19 +271,41 @@ def check_shopify_api(site_url, cc, proxy=None):
         else:
             response_msg = raw_status
 
-        # ---- Determine status (raw, will be refined later) ----
+        # ---- Determine status ----
+        # Start with ERROR and then upgrade to DECLINED/APPROVED/APPROVED_OTP
+        final_status = 'ERROR'
+
+        # If the API says success, it's at least an approval
         if api_success:
             if 'ORDER_PLACED' in raw_status.upper() or 'CHARGED' in raw_status.upper():
                 final_status = 'APPROVED'
             elif '3DS' in raw_status.upper() or 'OTP' in raw_status.upper() or 'AUTHENTICATION' in raw_status.upper():
                 final_status = 'APPROVED_OTP'
             elif 'INSUFFICIENT' in raw_status.upper():
-                final_status = 'APPROVED'
+                final_status = 'APPROVED'   # low funds still a live card
             else:
-                final_status = 'APPROVED'
+                final_status = 'APPROVED'   # fallback for success
         else:
-            # We will do detailed mapping later, but set a provisional status
-            final_status = 'DECLINED'  # default to declined if not a clear error
+            # Not success – check if it's a clear decline
+            decline_keywords = [
+                'DECLINED', 'CARD_DECLINED', 'INSTRUMENT_DECLINED',
+                'DO_NOT_HONOR', 'CALL_ISSUER', 'PICK_UP_CARD',
+                'INCORRECT_NUMBER', 'INCORRECT_CVC', 'INCORRECT_ZIP',
+                'INCORRECT_ADDRESS', 'INCORRECT_PIN',
+                'INVALID_AMOUNT', 'INVALID_CURRENCY',
+                'FRAUD_SUSPECTED', 'HIGH_RISK_FRAUD_SUSPECTED',
+                'CARD_TESTING', 'AUTHENTICATION_FAILED',
+                'EXPIRED_CARD', 'EXPIRED_SESSION',
+                'INSUFFICIENT_FUNDS'  # this is a decline but we keep it as decline (not error)
+            ]
+            msg_upper = raw_status.upper()
+            if any(kw in msg_upper for kw in decline_keywords):
+                final_status = 'DECLINED'
+            elif '3DS' in msg_upper or 'OTP' in msg_upper or 'AUTHENTICATION' in msg_upper:
+                final_status = 'APPROVED_OTP'
+            else:
+                # Keep as ERROR for everything else (proxy issues, CAPTCHA, site errors)
+                final_status = 'ERROR'
 
         return {
             'Response': response_msg,
@@ -291,7 +313,7 @@ def check_shopify_api(site_url, cc, proxy=None):
             'gateway': gateway,
             'price': price,
             'site': site_url,
-            'raw_response': response_msg  # <-- added
+            'raw_response': response_msg
         }
     except Exception as e:
         return {
@@ -306,40 +328,24 @@ def check_shopify_api(site_url, cc, proxy=None):
 def process_shopify_api_response(api_response, site_price='0.00'):
     """
     Extract (message, status, gateway) from the Shopify API response.
-    Maps all known decline reasons to DECLINED.
+    Preserves the status from the API (DECLINED/ERROR/APPROVED).
     """
     if not api_response or not isinstance(api_response, dict):
         return "System Error", "ERROR", "Shopify Payments"
 
     msg = api_response.get('Response', 'Unknown')
-    raw = api_response.get('raw_response', msg)  # fallback
     status = api_response.get('status', 'ERROR')
     gateway = api_response.get('gateway', 'Shopify Payments')
 
-    # ---- If status is already ERROR, check if it's actually a decline ----
+    # Additional safety: if status is ERROR but the raw response contains a decline, override
     if status == 'ERROR':
-        # Known decline reasons (from Shopify error codes)
+        raw = api_response.get('raw_response', msg).upper()
         decline_keywords = [
-            'DECLINED', 'CARD_DECLINED', 'INSTRUMENT_DECLINED',
-            'DO_NOT_HONOR', 'CALL_ISSUER', 'PICK_UP_CARD',
-            'INCORRECT_NUMBER', 'INCORRECT_CVC', 'INCORRECT_ZIP',
-            'INCORRECT_ADDRESS', 'INCORRECT_PIN',
-            'INVALID_AMOUNT', 'INVALID_CURRENCY',
-            'FRAUD_SUSPECTED', 'HIGH_RISK_FRAUD_SUSPECTED',
-            'CARD_TESTING', 'AUTHENTICATION_FAILED',
-            'EXPIRED_CARD', 'EXPIRED_SESSION',
+            'DECLINED', 'CARD_DECLINED', 'INSUFFICIENT_FUNDS',
+            'DO_NOT_HONOR', 'INCORRECT_CVC', 'INCORRECT_ZIP'
         ]
-        msg_upper = raw.upper()
-        if any(kw in msg_upper for kw in decline_keywords):
+        if any(kw in raw for kw in decline_keywords):
             status = 'DECLINED'
-
-    # If it's APPROVED_OTP, we keep it (but it's still a live response)
-    if status == 'APPROVED_OTP':
-        # This is an approved status – we treat as APPROVED for hit purposes
-        # but you can keep it separate if needed
-        pass
-
-    # If status is not ERROR or DECLINED, it's already fine.
 
     return msg, status, gateway
 

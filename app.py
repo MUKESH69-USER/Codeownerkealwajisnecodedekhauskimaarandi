@@ -297,22 +297,41 @@ from gates import (
 
 from complete_handler import setup_complete_handler
 
-# ---------- SETUP COMPLETE HANDLER ----------
+# ---------- DEFINE update_stats (used by complete_handler) ----------
+def update_stats_func(status, mass_check=False):
+    global stats_data
+    # Ensure all keys exist
+    for key in ['approved', 'declined', 'cooked', 'mass_approved', 'mass_declined', 'mass_cooked', 'error', 'mass_error']:
+        stats_data.setdefault(key, 0)
+    if status in ['APPROVED', 'APPROVED_OTP']:
+        key = 'mass_approved' if mass_check else 'approved'
+    elif status == 'COOKED':
+        key = 'mass_cooked' if mass_check else 'cooked'
+    elif status in ['DECLINED', 'EXPIRED']:
+        key = 'mass_declined' if mass_check else 'declined'
+    elif status == 'ERROR':
+        key = 'mass_error' if mass_check else 'error'
+    else:
+        return
+    stats_data[key] += 1
+    save_json(STATS_FILE, stats_data)
+
+# ---------- SETUP COMPLETE HANDLER (positional arguments) ----------
 handler_utils = setup_complete_handler(
-    bot=bot,
-    site_filter_func=get_filtered_sites,
-    proxies_data=proxies_data,
-    check_site_func=check_shopify_api,
-    is_valid_response_func=lambda r: True,
-    process_response_func=process_shopify_api_response,
-    update_stats_func=lambda status, mass_check: None,
-    save_json_func_param=save_json,
-    load_json_func_param=load_json,
-    is_user_allowed_func=is_approved,
-    users_data_ref=users_data,
-    users_file_param=USERS_FILE,
-    force_subscribe_decorator=force_subscribe_and_name,
-    user_sessions=user_sessions
+    bot,                          # bot
+    get_filtered_sites,           # site_filter_func
+    proxies_data,                 # proxies_data
+    check_shopify_api,            # check_site_func
+    lambda r: True,               # is_valid_response_func (dummy)
+    process_shopify_api_response, # process_response_func
+    update_stats_func,            # update_stats_func
+    save_json,                    # save_json_func_param
+    load_json,                    # load_json_func_param
+    is_approved,                  # is_user_allowed_func
+    users_data,                   # users_data_ref
+    USERS_FILE,                   # users_file_param
+    force_subscribe_and_name,     # force_subscribe_decorator
+    user_sessions                 # user_sessions
 )
 
 # Extract utilities from handler_utils
@@ -523,20 +542,6 @@ def proxy_add_prompt(call):
 
 def process_add_proxy_manual(message):
     # Delegate to /addpro command logic
-    from telebot import types
-    # We'll just simulate the command by calling the handler
-    # Create a fake command message
-    class FakeMessage:
-        def __init__(self, text, from_user, chat):
-            self.text = text
-            self.from_user = from_user
-            self.chat = chat
-    # But we already have the message object, just call the command handler with it.
-    # However, we need to handle the case where the user just replied with a proxy string.
-    # The easiest: call the add_proxy_cmd function with this message.
-    # But add_proxy_cmd expects a command like /addpro proxy. We'll just create a new message.
-    # We'll instead just directly add the proxy.
-    # Quick solution: call add_proxy_cmd with a modified text.
     message.text = "/addpro " + message.text
     add_proxy_cmd(message)
 
@@ -1160,7 +1165,6 @@ def set_amo(message):
         bot.reply_to(message, "Usage: /setamo <price>")
 
 # ---------- FILE UPLOAD HANDLER FOR PROXY FILES ----------
-# The complete_handler already handles CC file uploads; we only handle proxy files here.
 @bot.message_handler(content_types=['document'])
 def document_handler(message):
     user_id = message.from_user.id
